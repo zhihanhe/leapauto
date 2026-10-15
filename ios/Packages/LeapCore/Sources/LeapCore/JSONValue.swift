@@ -51,7 +51,10 @@ public enum JSONValue: Codable, Equatable, Sendable {
         switch self {
         case .string(let value): return value
         case .number(let value):
-            guard value.isFinite else { return nil }
+            // Account and polling IDs must not inherit Double's rounding. The
+            // boundary itself is unsafe: 2^53 + 1 decodes as 2^53. Larger IDs
+            // must arrive as strings; numeric telemetry still uses doubleValue.
+            guard value.isFinite, abs(value) < 9_007_199_254_740_992 else { return nil }
             if let integer = Int64(exactly: value) { return String(integer) }
             return String(value)
         case .bool(let value): return value ? "true" : "false"

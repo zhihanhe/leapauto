@@ -249,6 +249,7 @@ public actor LeapAPI {
     }
 
     private func begin() throws -> (id: UUID, epoch: UInt64) {
+        try Task.checkCancellation()
         guard activeOperation == nil else { throw LeapAPIError.busy }
         let id = UUID(); activeOperation = id
         return (id, generation)

@@ -20,6 +20,8 @@
 
 ### 一键离线验证
 
+本轮审查修复及红绿回归见 [REVIEW-FIXES.md](docs/REVIEW-FIXES.md)。Linux 聚合入口 `./scripts/validate.sh` 也会运行实际 AppModel 源码的离线编排测试；这不替代 Apple SDK 或模拟器验证。
+
 在 Mac 的 `ios/` 目录运行：
 
 ```sh

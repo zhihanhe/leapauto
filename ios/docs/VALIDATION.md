@@ -1,4 +1,8 @@
-# 验证记录：第二轮增量
+# 最新验证：审查缺陷修复
+
+2026-10-15 UTC：三条审查缺陷已修复并完成红绿回归。最新聚合结果为 LeapCore **152 项（149 通过、3 Apple 专属跳过、0 失败）**，实际 AppModel 源码的 Linux 离线编排测试 **20/20 通过**。Xcode/iOS SDK 构建仍未运行。详见 [本轮修复与验证](REVIEW-FIXES.md) 和 [完整日志](validation/review-fixes-tests.log)。以下保留第二轮交付时的历史记录，测试计数以本段为最新。
+
+# 历史验证记录：第二轮增量
 
 日期：2026-10-15 UTC。Android基线：`106b633bc4dbd0c816dd70e3160c22135e0cec6a`；首版iOS提交：`51e24af63c1f25acbfd5c398578609f75a2ae697`。
 

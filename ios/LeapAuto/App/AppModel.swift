@@ -19,11 +19,32 @@ final class AppModel: ObservableObject {
     @Published var widgetMessage: String?
 
     private var api: LeapAPI?
-    private let keychain = KeychainStore()
-    private let lifecycle = SessionLifecycleStore()
+    private let lifecycle: SessionLifecycleStore
+    private let pollingPolicy: ControlPollingPolicy
+    private let authenticate: @MainActor () async throws -> Void
+    private let loadSession: () throws -> Session?
+    private let saveSession: (Session) throws -> Void
+    private let removeSession: () throws -> Void
     private var generation = UUID()
     private var didRestore = false
     private lazy var widgetPublisher: WidgetSnapshotPublisher? = Self.isOfflineTestRun ? nil : WidgetSnapshotPublisher()
+
+    // Production defaults retain local authentication and device-only Keychain.
+    // Tests inject only offline transports and isolated persistence.
+    init(api: LeapAPI? = nil, pollingPolicy: ControlPollingPolicy = .app,
+         authenticate: @escaping @MainActor () async throws -> Void = { try await LocalControlAuthentication().verify() },
+         loadSession: @escaping () throws -> Session? = { try KeychainStore().load(Session.self, account: "session") },
+         saveSession: @escaping (Session) throws -> Void = { try KeychainStore().save($0, account: "session") },
+         removeSession: @escaping () throws -> Void = { try KeychainStore().remove(account: "session") },
+         lifecycle: SessionLifecycleStore = SessionLifecycleStore()) {
+        self.api = api
+        self.pollingPolicy = pollingPolicy
+        self.authenticate = authenticate
+        self.loadSession = loadSession
+        self.saveSession = saveSession
+        self.removeSession = removeSession
+        self.lifecycle = lifecycle
+    }
 
     static var isOfflineTestRun: Bool {
         let env = ProcessInfo.processInfo.environment
@@ -51,7 +72,7 @@ final class AppModel: ObservableObject {
             return
         }
         do {
-            guard let session = try keychain.load(Session.self, account: "session"), session.isAuthenticated else { return }
+            guard let session = try loadSession(), session.isAuthenticated else { return }
             api = LeapAPI(session: session)
             beginWidgetSession(source: .vehicle)
             mode = .connected
@@ -103,7 +124,7 @@ final class AppModel: ObservableObject {
             let imported = await client.snapshot()
             guard generation == scope else { return }
             // Save successful credential rotation before any subsequent read can fail.
-            try keychain.save(imported, account: "session")
+            try saveSession(imported)
             api = client
             importedClientCommitted = true
             beginWidgetSession(source: .vehicle)
@@ -253,7 +274,7 @@ final class AppModel: ObservableObject {
         }
         do {
             guard let client = api else { throw AppError.noVehicle }
-            try await LocalControlAuthentication().verify()
+            try await authenticate()
             guard generation == scope, selectedVehicle?.vin == vin else { return }
             let fresh = try await client.refreshStatus()
             guard generation == scope, selectedVehicle?.vin == vin else { return }
@@ -265,6 +286,7 @@ final class AppModel: ObservableObject {
             try Task.checkCancellation()
             submitted = true
             let receipt = try await client.send(command: command, pin: pin)
+            let deadline = ControlObservationDeadline(timeout: pollingPolicy.timeout)
             guard generation == scope else { return }
             await persistCurrentSession(scope: scope)
             guard generation == scope else { return }
@@ -273,7 +295,7 @@ final class AppModel: ObservableObject {
                 return
             }
             operationMessage = "服务端已受理，正在确认车辆执行结果…"
-            try await pollResult(client: client, messageID: messageID, scope: scope)
+            try await pollResult(client: client, messageID: messageID, scope: scope, deadline: deadline)
             await persistCurrentSession(scope: scope)
         } catch {
             guard generation == scope else { return }
@@ -284,38 +306,44 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func pollResult(client: LeapAPI, messageID: String, scope: UUID) async throws {
-        // Bounded observation of this one request; no mutation retries.
-        let deadline = Date().addingTimeInterval(24)
-        try await Task.sleep(nanoseconds: 500_000_000)
-        while Date() < deadline {
-            try Task.checkCancellation()
-            guard generation == scope else { return }
-            let result = try await client.pollResult(messageID: messageID)
-            guard generation == scope else { return }
-            guard Date() <= deadline else { break }
-            switch result {
-            case .succeeded:
-                operationMessage = "车辆接口已确认指令完成。正在刷新车况…"
-                let fresh = try await client.refreshStatus()
+    private func pollResult(client: LeapAPI, messageID: String, scope: UUID,
+                            deadline: ControlObservationDeadline) async throws {
+        // The same deadline bounds every awaited read, including credential
+        // refresh and the final telemetry query. No command POST is replayed.
+        let outcome = try await ControlResultObserver.observe(policy: pollingPolicy, deadline: deadline) {
+            try await client.pollResult(messageID: messageID)
+        }
+        guard generation == scope else { return }
+        switch outcome {
+        case .verified:
+            operationMessage = "车辆接口已确认指令完成。正在刷新车况…"
+            do {
+                let fresh = try await deadline.run { try await client.refreshStatus() }
                 guard generation == scope else { return }
                 status = fresh
                 publishWidgetStatus(fresh)
                 operationMessage = "车辆接口已确认指令完成，车况已刷新。"
-                return
-            case .failed(let message):
-                operationMessage = message
-                return
-            case .pending:
-                break
+            } catch {
+                guard generation == scope else { return }
+                // Execution confirmation is terminal. A separate telemetry or
+                // authentication failure cannot turn it back into uncertainty.
+                let confirmed = "车辆接口已确认指令完成。车况刷新未完成，请稍后核对。"
+                operationMessage = confirmed
+                await handleConnectedFailure(error, scope: scope, confirmedCommandMessage: confirmed)
             }
-            try await Task.sleep(nanoseconds: 500_000_000)
+        case .failed(let message):
+            operationMessage = message
+        case .timedOut:
+            operationMessage = "等待结果超时，执行状态未知。请刷新车况核对，勿重复操作。"
+        case .accepted:
+            // Observer currently returns only terminal outcomes. Fail closed if
+            // a future implementation returns acceptance without confirmation.
+            operationMessage = "服务端已受理，尚未确认车辆执行。请刷新车况，勿重复操作。"
         }
-        operationMessage = "等待结果超时，执行状态未知。请刷新车况核对，勿重复操作。"
     }
 
     @discardableResult
-    func logout() async -> UUID {
+    func logout(preservingOperationMessage: String? = nil) async -> UUID {
         // Invalidate late responses before crossing an actor boundary.
         lifecycle.markLogoutRequested()
         generation = UUID()
@@ -330,10 +358,10 @@ final class AppModel: ObservableObject {
         pendingCommand = nil
         isCommandRunning = false
         isBusy = false
-        operationMessage = nil
+        operationMessage = preservingOperationMessage
         errorMessage = nil
         do {
-            try keychain.remove(account: "session")
+            try removeSession()
             lifecycle.clearLogoutRequest()
             sessionDeletionFailed = false
         } catch {
@@ -344,16 +372,18 @@ final class AppModel: ObservableObject {
         return logoutScope
     }
 
-    private func handleConnectedFailure(_ error: Error, scope: UUID, submitted: Bool = false) async {
+    private func handleConnectedFailure(_ error: Error, scope: UUID, submitted: Bool = false,
+                                        confirmedCommandMessage: String? = nil) async {
         guard generation == scope else { return }
         if let apiError = error as? LeapAPIError,
            apiError == .authenticationRequired || apiError == .invalidSession {
-            let logoutScope = await logout()
+            let logoutScope = await logout(preservingOperationMessage: confirmedCommandMessage)
             guard generation == logoutScope else { return }
             errorMessage = sessionDeletionFailed
                 ? "会话已失效，本机清理未完成。请解锁后点击“重试清除会话”。"
                 : "会话已失效，已退出。请重新导入本人有效会话。"
-            if submitted { operationMessage = "已提交指令的执行状态仍未知，请通过车辆实际状态核对，勿重复操作。" }
+            if let confirmedCommandMessage { operationMessage = confirmedCommandMessage }
+            else if submitted { operationMessage = "已提交指令的执行状态仍未知，请通过车辆实际状态核对，勿重复操作。" }
             return
         }
         errorMessage = safeMessage(error)
@@ -368,7 +398,7 @@ final class AppModel: ObservableObject {
         guard generation == scope, mode == .connected, let client = api else { return }
         let snapshot = await client.snapshot()
         guard generation == scope else { return }
-        do { try keychain.save(snapshot, account: "session") }
+        do { try saveSession(snapshot) }
         catch { errorMessage = "会话更新未能保存到本机钥匙串，请解锁设备后重试。" }
     }
 
@@ -413,6 +443,7 @@ final class AppModel: ObservableObject {
         case let value as LeapAPIError: return value.errorDescription ?? "接口请求失败。"
         case let value as SessionImportError: return value.errorDescription ?? "会话文件无效。"
         case let value as ProtocolCryptoError: return value.errorDescription ?? "协议加密失败。"
+        case let value as ControlObservationError: return value.errorDescription ?? "车况刷新超时。"
         case let value as CommandValidationError: return value.errorDescription ?? "当前不能控制车辆。"
         case let value as KeychainStore.StoreError: return value.errorDescription ?? "钥匙串不可用。"
         case let value as LocalControlAuthentication.AuthenticationError: return value.errorDescription ?? "身份验证未通过。"
