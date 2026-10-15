@@ -48,4 +48,21 @@ final class RequestSigningTests: XCTestCase {
         XCTAssertThrowsError(try builder.request(base: TrustedEndpoints.global, path: "//attacker.invalid"))
         XCTAssertThrowsError(try builder.request(base: TrustedEndpoints.global, path: "/../other"))
     }
+
+    func testHeaderBoundaryRejectsControlScalarsAndInvalidNamesBeforeFoundation() throws {
+        let builder = LeapRequestBuilder(crypto: RecordingShapeCrypto())
+        let invalidValues = ["a\r\nb", "a\rb", "a\nb", "\r\n", "a\u{0}b", "a\tB",
+                             "a\u{7f}b", "a\u{85}b", "a\u{2028}b", "a\u{2029}b"]
+        for value in invalidValues {
+            XCTAssertThrowsError(try builder.request(base: TrustedEndpoints.global, path: "/test", headers: ["token": value])) {
+                XCTAssertEqual($0 as? LeapAPIError, .invalidSession)
+            }
+        }
+        for name in ["", "bad name", "bad:name", "bad\r\nname", "bad\rname", "bad\nname", "bad\u{0}name", "名称"] {
+            XCTAssertThrowsError(try builder.request(base: TrustedEndpoints.global, path: "/test", headers: [name: "value"]))
+        }
+        let request = try builder.request(base: TrustedEndpoints.global, path: "/test",
+                                          headers: ["X-Test_Header": "valid-token_123 /+=", "digest": ""])
+        XCTAssertEqual(request.value(forHTTPHeaderField: "X-Test_Header"), "valid-token_123 /+=")
+    }
 }

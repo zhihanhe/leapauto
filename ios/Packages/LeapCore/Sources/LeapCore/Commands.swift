@@ -19,6 +19,7 @@ public enum CommandValidationError: Error, Equatable, LocalizedError, Sendable {
     case staleOrUnknownStatusTime
     case vehicleMoving
     case unknownDrivingState
+    case sentryCapabilityUnknown
 
     public var errorDescription: String? {
         switch self {
@@ -27,6 +28,7 @@ public enum CommandValidationError: Error, Equatable, LocalizedError, Sendable {
         case .staleOrUnknownStatusTime: return "车况时间缺失或已过期，请刷新后再操作。"
         case .vehicleMoving: return "车辆正在行驶或处于前进／倒车挡，请停车后再操作。"
         case .unknownDrivingState: return "尚不能确认车辆已停稳并挂 P 挡，暂不能远程控制。"
+        case .sentryCapabilityUnknown: return "当前车辆尚未提供有效哨兵状态，暂不能远程操作哨兵。"
         }
     }
 }
@@ -40,6 +42,7 @@ public enum LeapCommand: Hashable, Identifiable, Sendable {
     case sunroofOpen, sunroofClose, horn, batteryPreheat, batteryPreheatOff
     case acOn, acOff, quickCool, quickHeat, defrost, deodorize
     case startCharging, stopCharging, unlockCharger
+    case sentryOn, sentryOff
     case setACTemperature(Int)
 
     public var id: String {
@@ -76,6 +79,8 @@ public enum LeapCommand: Hashable, Identifiable, Sendable {
         case .startCharging: return "开始充电"
         case .stopCharging: return "停止充电"
         case .unlockCharger: return "解锁充电枪"
+        case .sentryOn: return "开启哨兵模式"
+        case .sentryOff: return "关闭哨兵模式"
         case .setACTemperature(let temperature): return "设置空调 \(temperature)°C"
         }
     }
@@ -86,6 +91,15 @@ public enum LeapCommand: Hashable, Identifiable, Sendable {
         switch self {
         case .unlock, .trunkOpen, .frunkOpen, .windowOpen, .windowVent, .sunroofOpen: return true
         default: return false
+        }
+    }
+
+    /// Explicit target, never a toggle inferred from missing telemetry.
+    public var sentryTarget: Bool? {
+        switch self {
+        case .sentryOn: return true
+        case .sentryOff: return false
+        default: return nil
         }
     }
 
@@ -106,6 +120,9 @@ public enum LeapCommand: Hashable, Identifiable, Sendable {
         case .parked: break
         case .moving: throw CommandValidationError.vehicleMoving
         case .unknown: throw CommandValidationError.unknownDrivingState
+        }
+        if sentryTarget != nil, status.sentryMode == nil {
+            throw CommandValidationError.sentryCapabilityUnknown
         }
     }
 
@@ -140,6 +157,8 @@ public enum LeapCommand: Hashable, Identifiable, Sendable {
         case .startCharging: return try simple("193", "start")
         case .stopCharging: return try simple("193", "stop")
         case .unlockCharger: return try CommandPayload(commandID: "192", state: ["operation": .string("unlock")])
+        case .sentryOn: return try CommandPayload(commandID: "400", state: ["operation": .string("on")])
+        case .sentryOff: return try CommandPayload(commandID: "400", state: ["operation": .string("off")])
         case .acOn: return try climate(operate: "auto", temperature: 24, wind: 3, mode: "cold")
         case .acOff: return try climate(operate: "off", temperature: 24, wind: 3, mode: "nohotcold")
         // Current Kotlin executable presets use wshld=1 here. API/API.md's

@@ -99,6 +99,92 @@ final class APIClientTests: XCTestCase {
         return (String(decoding: try root.encodedData(), as: UTF8.self), token)
     }
 
+    func testConnectionConfigurationUsesReadOnlyBoundRequest() async throws {
+        let transport = FixtureTransport([.json("{\"code\":0,\"data\":{\"vin\":\"FIXTUREVIN0000001\",\"config\":{\"4\":{\"mac\":\"12:34:56:78:9A:BC\",\"version\":\"fixture-v1\"}}}}")])
+        let api = client(transport)
+        let configuration = try await api.connectionConfiguration()
+        XCTAssertTrue(configuration.hasBluetoothConfiguration)
+        XCTAssertEqual(configuration.controllerVersion, "fixture-v1")
+        let requests = await transport.allRequests()
+        XCTAssertEqual(requests.count, 1)
+        let request = try XCTUnwrap(requests.first)
+        XCTAssertEqual(request.httpMethod, "GET")
+        XCTAssertEqual(request.url?.host, "appgateway.leapmotor.com")
+        XCTAssertEqual(request.url?.path, "/carownerservice/v3/api/vehicleinfo/commonConfig")
+        XCTAssertNil(request.httpBody)
+        let query = URLComponents(url: try XCTUnwrap(request.url), resolvingAgainstBaseURL: false)?.queryItems ?? []
+        XCTAssertEqual(query.first(where: { $0.name == "vin" })?.value, "FIXTUREVIN0000001")
+        XCTAssertEqual(query.first(where: { $0.name == "osType" })?.value, "Android")
+        XCTAssertNotNil(request.value(forHTTPHeaderField: "sign"))
+        let commandCount = await transport.commandCount()
+        XCTAssertEqual(commandCount, 0)
+    }
+
+    func testConnectionConfigurationRejectsAnotherVehicle() async throws {
+        let transport = FixtureTransport([.json("{\"code\":0,\"data\":{\"vin\":\"ANOTHERVEHICLE001\",\"config\":{}}}")])
+        do { _ = try await client(transport).connectionConfiguration(); XCTFail("Wrong vehicle must fail") }
+        catch { XCTAssertEqual(error as? LeapAPIError, .invalidResponse) }
+    }
+
+    func testConnectionConfigurationRejectsMismatchedAccountWithoutRequest() async throws {
+        var candidate = session()
+        candidate.newAuth?.accountID = "different-account"
+        let transport = FixtureTransport([])
+        do { _ = try await client(transport, session: candidate).connectionConfiguration(); XCTFail("Identity must match") }
+        catch { XCTAssertEqual(error as? LeapAPIError, .invalidSession) }
+        let count = await transport.count()
+        XCTAssertEqual(count, 0)
+    }
+
+    func testRefreshVehicleMetadataRetainsC10CapabilitiesWithoutSwitchingVehicle() async throws {
+        let transport = FixtureTransport([.json("{\"code\":0,\"data\":[{\"vin\":\"FIXTUREVIN0000001\",\"carType\":\"C10\",\"funcConfig\":{\"HVAC\":{\"supported\":true}}}]}")])
+        let api = client(transport)
+        let vehicle = try await api.refreshSelectedVehicleMetadata()
+        XCTAssertEqual(vehicle.modelName, "C10")
+        XCTAssertEqual(vehicle.capabilities[.hvac], .supported)
+        let snapshot = await api.snapshot()
+        XCTAssertEqual(snapshot.selectedVIN, "FIXTUREVIN0000001")
+        XCTAssertEqual(snapshot.selectedCarType, "C10")
+    }
+
+    func testRefreshMetadataCannotSilentlyReplaceMissingVehicle() async throws {
+        let transport = FixtureTransport([.json("{\"code\":0,\"data\":[{\"vin\":\"OTHERFIXTUREVIN01\",\"carType\":\"C10\"}]}")])
+        let api = client(transport)
+        do { _ = try await api.refreshSelectedVehicleMetadata(); XCTFail("Must not select another vehicle") }
+        catch { XCTAssertEqual(error as? LeapAPIError, .unknownVehicle) }
+        let snapshot = await api.snapshot()
+        XCTAssertEqual(snapshot.selectedVIN, "FIXTUREVIN0000001")
+    }
+
+    func testSentryRechecksOwnerAndSubmitsExactlyOnce() async throws {
+        let owner = "{\"code\":0,\"data\":[{\"vin\":\"FIXTUREVIN0000001\",\"carType\":\"C10\",\"isOwner\":true}]}"
+        let status = parked.replacingOccurrences(of: "\"soc\":70", with: "\"soc\":70,\"3636\":0")
+        let transport = FixtureTransport([.json(owner), .json(status), .json(owner), .json("{\"code\":0,\"data\":{\"msgID\":\"fixture-sentry\"}}")])
+        let api = client(transport)
+        _ = try await api.bootstrap()
+        _ = try await api.refreshStatus()
+        let receipt = try await api.send(command: .sentryOn, pin: "0000")
+        XCTAssertEqual(receipt.messageID, "fixture-sentry")
+        let requests = await transport.allRequests()
+        XCTAssertEqual(requests.filter { $0.url?.path == "/app/app-global-service/v1/vehicle/list" }.count, 2)
+        let count = await transport.commandCount()
+        XCTAssertEqual(count, 1)
+    }
+
+    func testSentryOwnershipRevokedDuringPreflightBlocksDispatch() async throws {
+        let owner = "{\"code\":0,\"data\":[{\"vin\":\"FIXTUREVIN0000001\",\"isOwner\":true}]}"
+        let shared = owner.replacingOccurrences(of: "true", with: "false")
+        let status = parked.replacingOccurrences(of: "\"soc\":70", with: "\"soc\":70,\"3636\":0")
+        let transport = FixtureTransport([.json(owner), .json(status), .json(shared)])
+        let api = client(transport)
+        _ = try await api.bootstrap()
+        _ = try await api.refreshStatus()
+        do { _ = try await api.send(command: .sentryOn, pin: "0000"); XCTFail("Revoked owner must not dispatch") }
+        catch { XCTAssertEqual(error as? SentryControlError, .sharedAccountCannotEnable) }
+        let count = await transport.commandCount()
+        XCTAssertEqual(count, 0)
+    }
+
     func testGatewayCredentialRotationSurvivesLaterReadFailure() async throws {
         let reply = try gatewayReply()
         let transport = FixtureTransport([.json(reply.json), .error(.networkUnavailable)])

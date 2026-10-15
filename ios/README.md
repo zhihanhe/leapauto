@@ -1,6 +1,6 @@
 # 零跑智控 iOS 原生移植工程
 
-这是从 [zhihanhe/leapauto](https://github.com/zhihanhe/leapauto) 的 Android 版本移植出的 **SwiftUI 开发预览工程**。基线提交：`106b633bc4dbd0c816dd70e3160c22135e0cec6a`。Android 原目录保留。
+这是从 [zhihanhe/leapauto](https://github.com/zhihanhe/leapauto) 的 Android 版本移植出的 **SwiftUI 开发预览工程**。基线提交：`106b633bc4dbd0c816dd70e3160c22135e0cec6a`。Android 应用与构建目录已移除；协议来源保留在 Git 历史及 `API/`。
 
 > **状态：核心 Swift 包已在 Linux 实际编译并运行离线测试；Xcode 编译、模拟器 UI、iPhone 和实车尚未验证。不是可直接安装的 IPA，也不是功能完整的发布版。**
 >
@@ -41,6 +41,7 @@ Linux 会明确跳过 Apple CryptoKit/AES/RSA 测试；这不构成这些路径�
 ## 2. 目前能做什么
 
 - 原生 SwiftUI 首页、车况、续航充电、空调、车辆位置状态和设置
+- 接入/切车/刷新后只读同步连接配置、车型能力白名单显示；云端连接与蓝牙认证状态明确分开，不按 C10 名称推断支持
 - 清晰标识的离线演示；未知信号不伪装成正常值
 - 开发者本人有效会话 JSON 导入、网关交换、车辆列表/切换、路由与车况请求
 - 按上游协议构造基础车身、空调和充电指令；结果查询和超时状态明确区分

@@ -17,6 +17,9 @@ final class AppModel: ObservableObject {
     @Published var isCommandRunning = false
     @Published var sessionDeletionFailed = false
     @Published var widgetMessage: String?
+    @Published var connectionConfiguration: VehicleConnectionConfiguration?
+    @Published var connectionConfigurationMessage: String?
+    @Published var vehicleMetadataUpdatedAt: Date?
 
     private var api: LeapAPI?
     private let lifecycle: SessionLifecycleStore
@@ -62,6 +65,16 @@ final class AppModel: ObservableObject {
         catch { return false }
     }
 
+    func canRequest(_ command: LeapCommand) -> Bool {
+        guard canControl else { return false }
+        if mode == .demo { return true }
+        do {
+            try command.validate(status: status)
+            try SentryControlPolicy.validate(command: command, ownership: selectedVehicle?.ownership ?? .unknown)
+            return true
+        } catch { return false }
+    }
+
     func restore() async {
         guard !Self.isOfflineTestRun, !didRestore, mode == .signedOut else { return }
         didRestore = true
@@ -86,6 +99,9 @@ final class AppModel: ObservableObject {
     func enterDemo() {
         guard !isBusy, !isCommandRunning else { return }
         generation = UUID()
+        connectionConfiguration = nil
+        connectionConfigurationMessage = nil
+        vehicleMetadataUpdatedAt = nil
         api = nil
         mode = .demo
         beginWidgetSession(source: .demo)
@@ -107,6 +123,9 @@ final class AppModel: ObservableObject {
         errorMessage = nil
         generation = UUID()
         let scope = generation
+        connectionConfiguration = nil
+        connectionConfigurationMessage = nil
+        vehicleMetadataUpdatedAt = nil
         var importedClientCommitted = false
         beginWidgetSession(source: mode == .demo ? .demo : .vehicle)
         defer { if generation == scope { isBusy = false } }
@@ -138,6 +157,7 @@ final class AppModel: ObservableObject {
             let snapshot = await client.snapshot()
             guard generation == scope else { return }
             vehicles = list
+            vehicleMetadataUpdatedAt = Date()
             selectedVehicle = list.first(where: { $0.vin == snapshot.selectedVIN }) ?? list.first
             if selectedVehicle != nil {
                 let fresh = try await client.refreshStatus()
@@ -145,6 +165,7 @@ final class AppModel: ObservableObject {
                 status = fresh
                 publishWidgetStatus(fresh)
             }
+            await updateConnectionDetails(client: client, scope: scope, reloadVehicleMetadata: false)
             await persistCurrentSession(scope: scope)
             guard generation == scope else { return }
             operationMessage = "会话已导入本机钥匙串。请先核对所选车辆与车况。"
@@ -169,6 +190,7 @@ final class AppModel: ObservableObject {
             let snapshot = await client.snapshot()
             guard generation == scope else { return }
             vehicles = list
+            vehicleMetadataUpdatedAt = Date()
             selectedVehicle = list.first(where: { $0.vin == snapshot.selectedVIN }) ?? list.first
             if selectedVehicle != nil {
                 let fresh = try await client.refreshStatus()
@@ -176,6 +198,7 @@ final class AppModel: ObservableObject {
                 status = fresh
                 publishWidgetStatus(fresh)
             }
+            await updateConnectionDetails(client: client, scope: scope, reloadVehicleMetadata: false)
             await persistCurrentSession(scope: scope)
             guard generation == scope else { return }
         } catch {
@@ -203,6 +226,7 @@ final class AppModel: ObservableObject {
             guard generation == scope else { return }
             status = fresh
             publishWidgetStatus(fresh)
+            await updateConnectionDetails(client: client, scope: scope, reloadVehicleMetadata: true)
             await persistCurrentSession(scope: scope)
             guard generation == scope else { return }
         } catch {
@@ -214,6 +238,9 @@ final class AppModel: ObservableObject {
     func selectVehicle(_ vehicle: Vehicle) async {
         guard !isBusy, !isCommandRunning, pendingCommand == nil, mode == .connected, let client = api else { return }
         generation = UUID()
+        connectionConfiguration = nil
+        connectionConfigurationMessage = nil
+        vehicleMetadataUpdatedAt = nil
         let scope = generation
         isBusy = true
         status = nil
@@ -229,6 +256,7 @@ final class AppModel: ObservableObject {
             guard generation == scope else { return }
             status = fresh
             publishWidgetStatus(fresh)
+            await updateConnectionDetails(client: client, scope: scope, reloadVehicleMetadata: true)
             await persistCurrentSession(scope: scope)
             guard generation == scope else { return }
         } catch {
@@ -237,12 +265,69 @@ final class AppModel: ObservableObject {
         }
     }
 
+    /// User-initiated metadata read; no pairing, certificate provisioning or BLE
+    /// side effects. A failed optional read does not invalidate good telemetry.
+    func inspectConnectionConfiguration() async {
+        guard !isBusy, !isCommandRunning, pendingCommand == nil else { return }
+        guard mode == .connected, selectedVehicle != nil, let client = api else {
+            connectionConfigurationMessage = "请先导入本人会话并选择车辆；离线演示不会查询真实配置。"
+            return
+        }
+        let scope = generation
+        isBusy = true
+        connectionConfiguration = nil
+        connectionConfigurationMessage = nil
+        defer { if generation == scope { isBusy = false } }
+        await updateConnectionDetails(client: client, scope: scope, reloadVehicleMetadata: true)
+        // A valid metadata refresh can remove the selected VIN after rotating
+        // credentials. Persist that rotation while the same session is active.
+        guard generation == scope else { return }
+        await persistCurrentSession(scope: scope)
+    }
+
+    /// Best-effort metadata refresh after connection/selection/status refresh.
+    /// Failures stay separate from valid telemetry and never start BLE hardware.
+    private func updateConnectionDetails(client: LeapAPI, scope: UUID, reloadVehicleMetadata: Bool) async {
+        guard generation == scope, mode == .connected, let vin = selectedVehicle?.vin else { return }
+        connectionConfigurationMessage = nil
+        do {
+            if reloadVehicleMetadata {
+                let vehicle = try await client.refreshSelectedVehicleMetadata()
+                guard generation == scope, selectedVehicle?.vin == vin else { return }
+                selectedVehicle = vehicle
+                if let index = vehicles.firstIndex(where: { $0.vin == vin }) { vehicles[index] = vehicle }
+                vehicleMetadataUpdatedAt = Date()
+            }
+            let configuration = try await client.connectionConfiguration()
+            guard generation == scope, selectedVehicle?.vin == vin else { return }
+            connectionConfiguration = configuration
+        } catch {
+            guard generation == scope, selectedVehicle?.vin == vin else { return }
+            connectionConfiguration = nil
+            if let failure = error as? LeapAPIError,
+               failure == .authenticationRequired || failure == .invalidSession {
+                await handleConnectedFailure(error, scope: scope)
+            } else {
+                if error as? LeapAPIError == .unknownVehicle {
+                    selectedVehicle = nil
+                    status = nil
+                    vehicleMetadataUpdatedAt = nil
+                    clearWidgetSnapshot()
+                }
+                connectionConfigurationMessage = safeMessage(error)
+            }
+        }
+    }
+
     func request(_ command: LeapCommand) {
         guard !isCommandRunning, !isBusy, pendingCommand == nil else { return }
         errorMessage = nil
         do {
             guard selectedVehicle != nil else { throw AppError.noVehicle }
-            if mode != .demo { try command.validate(status: status) }
+            if mode != .demo {
+                try command.validate(status: status)
+                try SentryControlPolicy.validate(command: command, ownership: selectedVehicle?.ownership ?? .unknown)
+            }
             pendingCommand = command
         } catch { errorMessage = safeMessage(error) }
     }
@@ -281,6 +366,7 @@ final class AppModel: ObservableObject {
             status = fresh
             publishWidgetStatus(fresh)
             try command.validate(status: fresh)
+            try SentryControlPolicy.validate(command: command, ownership: selectedVehicle?.ownership ?? .unknown)
             // Once this call starts, a network error does not prove that the
             // vehicle did not receive the instruction. Never automatically resend.
             try Task.checkCancellation()
@@ -295,10 +381,18 @@ final class AppModel: ObservableObject {
                 return
             }
             operationMessage = "服务端已受理，正在确认车辆执行结果…"
-            try await pollResult(client: client, messageID: messageID, scope: scope, deadline: deadline)
+            try await pollResult(client: client, messageID: messageID, command: command,
+                                 sentryBaselineTimestamp: fresh.sourceTimestamp, scope: scope, deadline: deadline)
             await persistCurrentSession(scope: scope)
         } catch {
             guard generation == scope else { return }
+            if error is SentryControlError {
+                // Ownership is checked before the command POST. A policy denial
+                // is not an ambiguous vehicle execution outcome.
+                submitted = false
+                operationMessage = nil
+                selectedVehicle?.ownership = .unknown
+            }
             if submitted {
                 operationMessage = "执行结果尚未确认。请刷新车况核对，勿重复操作。"
             }
@@ -306,7 +400,8 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func pollResult(client: LeapAPI, messageID: String, scope: UUID,
+    private func pollResult(client: LeapAPI, messageID: String, command: LeapCommand,
+                            sentryBaselineTimestamp: Date?, scope: UUID,
                             deadline: ControlObservationDeadline) async throws {
         // The same deadline bounds every awaited read, including credential
         // refresh and the final telemetry query. No command POST is replayed.
@@ -316,18 +411,32 @@ final class AppModel: ObservableObject {
         guard generation == scope else { return }
         switch outcome {
         case .verified:
-            operationMessage = "车辆接口已确认指令完成。正在刷新车况…"
+            operationMessage = command.sentryTarget == nil
+                ? "车辆接口已确认指令完成。正在刷新车况…"
+                : "接口已返回结果，正在核对哨兵状态…"
             do {
                 let fresh = try await deadline.run { try await client.refreshStatus() }
                 guard generation == scope else { return }
                 status = fresh
                 publishWidgetStatus(fresh)
-                operationMessage = "车辆接口已确认指令完成，车况已刷新。"
+                let hasNewSentryObservation: Bool
+                if let baseline = sentryBaselineTimestamp, let observed = fresh.sourceTimestamp {
+                    hasNewSentryObservation = observed > baseline
+                } else { hasNewSentryObservation = false }
+                if let target = command.sentryTarget,
+                   !hasNewSentryObservation || !fresh.isFreshForControl()
+                    || !SentryControlPolicy.isConfirmed(targetEnabled: target, telemetryEnabled: fresh.sentryMode) {
+                    operationMessage = "接口返回完成，但哨兵状态未确认达到目标。请稍后刷新核对，勿重复操作。"
+                } else {
+                    operationMessage = "车辆接口已确认指令完成，车况已刷新。"
+                }
             } catch {
                 guard generation == scope else { return }
                 // Execution confirmation is terminal. A separate telemetry or
                 // authentication failure cannot turn it back into uncertainty.
-                let confirmed = "车辆接口已确认指令完成。车况刷新未完成，请稍后核对。"
+                let confirmed = command.sentryTarget == nil
+                    ? "车辆接口已确认指令完成。车况刷新未完成，请稍后核对。"
+                    : "接口返回完成，但哨兵车况刷新未完成，状态仍待核对。请勿重复操作。"
                 operationMessage = confirmed
                 await handleConnectedFailure(error, scope: scope, confirmedCommandMessage: confirmed)
             }
@@ -355,6 +464,9 @@ final class AppModel: ObservableObject {
         vehicles = []
         selectedVehicle = nil
         status = nil
+        connectionConfiguration = nil
+        connectionConfigurationMessage = nil
+        vehicleMetadataUpdatedAt = nil
         pendingCommand = nil
         isCommandRunning = false
         isBusy = false
@@ -444,6 +556,7 @@ final class AppModel: ObservableObject {
         case let value as SessionImportError: return value.errorDescription ?? "会话文件无效。"
         case let value as ProtocolCryptoError: return value.errorDescription ?? "协议加密失败。"
         case let value as ControlObservationError: return value.errorDescription ?? "车况刷新超时。"
+        case let value as SentryControlError: return value.errorDescription ?? "当前账号不能执行该操作。"
         case let value as CommandValidationError: return value.errorDescription ?? "当前不能控制车辆。"
         case let value as KeychainStore.StoreError: return value.errorDescription ?? "钥匙串不可用。"
         case let value as LocalControlAuthentication.AuthenticationError: return value.errorDescription ?? "身份验证未通过。"

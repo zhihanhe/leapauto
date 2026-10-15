@@ -30,6 +30,16 @@ struct SettingsView: View {
                 }
             }
 
+            NavigationLink {
+                VehicleConnectionView()
+            } label: {
+                Label("车辆连接与能力", systemImage: "antenna.radiowaves.left.and.right")
+                    .font(.headline)
+                    .frame(maxWidth: .infinity, minHeight: 44, alignment: .leading)
+            }
+            .buttonStyle(.bordered)
+            .accessibilityIdentifier("settings.connection")
+
             GlassCard {
                 VStack(alignment: .leading, spacing: 16) {
                     SectionHeading(title: "隐私与安全")

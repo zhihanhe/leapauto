@@ -1,27 +1,29 @@
-.gradle/
-.gradle-local/
 build/
 **/build/
-.kotlin/
+# Keep historical local secret locations excluded after the platform migration.
 local.properties
 keystore/
-.idea/
-*.iml
 .vscode/
-*.ipr
-*.iws
-captures/
-.externalNativeBuild/
-.cxx/
-*.apk
 *.log
 backups/
-tmp_check_mainactivity.js
 __pycache__/
 *.pyc
 .codex/
 .reasonix/
 leap-api/
+
+# Swift/Xcode output and local signing/session files
+.build/
+.swiftpm/
+DerivedData/
+*.xcuserstate
+xcuserdata/
+*.xcarchive
+*.ipa
+*.mobileprovision
+*.p12
+AuthSession*.json
+Local.xcconfig
 
 # OS generated files
 .DS_Store
@@ -34,4 +36,3 @@ desktop.ini
 *.bak
 *.swp
 *~
-

@@ -31,6 +31,9 @@ def configs(name, base):
         settings = dict(base)
         settings['SWIFT_OPTIMIZATION_LEVEL'] = '-Onone' if mode=='Debug' else '-O'
         settings['DEBUG_INFORMATION_FORMAT'] = 'dwarf' if mode=='Debug' else 'dwarf-with-dsym'
+        # Keep app, widget, test hosts and local Swift package on the same active
+        # simulator architecture. Release still builds all standard architectures.
+        settings['ONLY_ACTIVE_ARCH'] = 'YES' if mode=='Debug' else 'NO'
         if mode=='Debug': settings['ENABLE_TESTABILITY']='YES'; settings['SWIFT_ACTIVE_COMPILATION_CONDITIONS']='DEBUG $(inherited)'
         ids.append(add(name+mode, {'isa':'XCBuildConfiguration', 'buildSettings':settings, 'name':mode}))
     return add(name+'Configs',{'isa':'XCConfigurationList','buildConfigurations':ids,'defaultConfigurationIsVisible':'0','defaultConfigurationName':'Release'})

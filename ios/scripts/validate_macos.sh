@@ -8,9 +8,6 @@ fi
 xcodebuild -version
 python3 scripts/validate_structure.py
 swift test --package-path Packages/LeapCore
-xcodebuild -project LeapAuto.xcodeproj -scheme LeapAuto -sdk iphonesimulator \
-  -destination 'generic/platform=iOS Simulator' -derivedDataPath DerivedData \
-  CODE_SIGNING_ALLOWED=NO build
 SIMULATOR_ID="${SIMULATOR_ID:-$(xcrun simctl list devices available -j | python3 -c '
 import json, sys
 data=json.load(sys.stdin)
@@ -22,8 +19,13 @@ if [[ -z "$SIMULATOR_ID" ]]; then
   echo '未找到可用 iOS 17+ iPhone 模拟器。请在 Xcode Settings → Platforms 安装 iOS runtime。' >&2
   exit 2
 fi
+# Build and test one concrete simulator with the same active architecture. A
+# generic destination can build a universal widget against a thin package module.
+xcodebuild -project LeapAuto.xcodeproj -scheme LeapAuto -configuration Debug -sdk iphonesimulator \
+  -destination "platform=iOS Simulator,id=$SIMULATOR_ID" -derivedDataPath DerivedData \
+  ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO build
 mkdir -p build
-xcodebuild -project LeapAuto.xcodeproj -scheme LeapAuto \
+xcodebuild -project LeapAuto.xcodeproj -scheme LeapAuto -configuration Debug \
   -destination "platform=iOS Simulator,id=$SIMULATOR_ID" -derivedDataPath DerivedData \
   -resultBundlePath "build/OfflineTests-$(date +%Y%m%d-%H%M%S).xcresult" \
-  CODE_SIGNING_ALLOWED=NO test
+  ONLY_ACTIVE_ARCH=YES CODE_SIGNING_ALLOWED=NO test

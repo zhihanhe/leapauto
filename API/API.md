@@ -748,8 +748,8 @@
 ---
 
 ### 接口 21：车辆蓝牙广播配置与 MAC 查询
-* **URL**: `POST https://appgateway.leapmotor.com/carownerservice/v3/api/vehicleinfo/commonConfig`
-* **Form Body**: `vin={vin}&type=4`
+* **当前可执行客户端契约**: `GET https://appgateway.leapmotor.com/carownerservice/v3/api/vehicleinfo/commonConfig`，查询参数 `appVersion`、`osType`、`vin`，网关签名头。依据迁移前 `LeapmotorApi.buildBluetoothVehicleMetadataRequest` / `buildBluetoothCloudRequest`（Git 提交 `85315dc`）。iOS 保留导入会话的平台身份，不伪造 Android 身份。
+* **旧文档差异**: 先前记载 POST + `vin/type=4`，与当前客户端不一致；本次移植遵循可执行源码，尚未用真实 iOS 会话验证。
 * **返回数据**: 车辆蓝牙广播物理 MAC 地址、广播主次协议版本号。
 * **客户端方法**: `LeapmotorApi.getBluetoothVehicleMetadata()`
 

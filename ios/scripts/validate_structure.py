@@ -97,6 +97,12 @@ for target in ['LeapAuto','LeapAutoWidget']:
         settings=objects[config]['buildSettings']
         assert settings['CODE_SIGN_ENTITLEMENTS']==f'{target}/{target}.entitlements'
         if target=='LeapAutoWidget': assert settings['APPLICATION_EXTENSION_API_ONLY']=='YES'
+# Generated project and every target must agree on simulator architecture policy.
+for value in objects.values():
+    if value.get('isa') == 'XCBuildConfiguration':
+        settings = value['buildSettings']
+        expected_arch = 'YES' if value['name'] == 'Debug' else 'NO'
+        assert settings['ONLY_ACTIVE_ARCH'] == expected_arch
 if errors: print('\n'.join(errors),file=sys.stderr); sys.exit(1)
 print('PASS: target-specific source membership, widget embedding, App Groups, XML/plists/assets, local package and permission/configuration boundaries.')
 print('NOT TESTED by this check: iOS type checking/linking, SwiftUI rendering, signing, Keychain, Face ID or live vehicle behavior.')

@@ -153,7 +153,19 @@ public struct LeapRequestBuilder: Sendable {
         var result = URLRequest(url: url, cachePolicy: .reloadIgnoringLocalCacheData, timeoutInterval: 30)
         result.httpMethod = method
         for (name, value) in headers {
-            guard !name.contains("\r"), !name.contains("\n"), !value.contains("\r"), !value.contains("\n") else {
+            // CRLF is a single Swift Character, so Character-level contains of
+            // CR or LF alone misses that pair. Validate bytes/scalars before
+            // Foundation can normalize or silently discard malformed headers.
+            let tokenPunctuation = Set("!#$%&'*+-.^_`|~".utf8)
+            let validName = !name.isEmpty && name.utf8.allSatisfy { byte in
+                (48...57).contains(byte) || (65...90).contains(byte)
+                    || (97...122).contains(byte) || tokenPunctuation.contains(byte)
+            }
+            let validValue = value.unicodeScalars.allSatisfy { scalar in
+                !CharacterSet.controlCharacters.contains(scalar)
+                    && !CharacterSet.newlines.contains(scalar)
+            }
+            guard validName, validValue else {
                 throw LeapAPIError.invalidSession
             }
             result.setValue(value, forHTTPHeaderField: name)

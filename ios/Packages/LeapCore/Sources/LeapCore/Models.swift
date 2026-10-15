@@ -4,20 +4,26 @@ public struct Vehicle: Codable, Equatable, Identifiable, Sendable {
     public var vin: String
     public var modelName: String?
     public var plateNumber: String?
+    public var capabilities: VehicleCapabilities
+    public var ownership: VehicleOwnership
     public var id: String { vin }
     public var carType: String? { modelName }
 
-    public init(vin: String, modelName: String? = nil, plateNumber: String? = nil) {
+    public init(vin: String, modelName: String? = nil, plateNumber: String? = nil, capabilities: VehicleCapabilities = .unknown, ownership: VehicleOwnership = .unknown) {
         self.vin = vin
         self.modelName = modelName
         self.plateNumber = plateNumber
+        self.capabilities = capabilities
+        self.ownership = ownership
     }
 
     public init(json: JSONValue) {
         self.init(
             vin: json["vin"]?.scalarString ?? "",
             modelName: json["carType"]?.stringValue ?? json["modelName"]?.stringValue,
-            plateNumber: json["licensePlate"]?.stringValue ?? json["plateNumber"]?.stringValue
+            plateNumber: json["licensePlate"]?.stringValue ?? json["plateNumber"]?.stringValue,
+            capabilities: VehicleCapabilities(funcConfig: json["funcConfig"]),
+            ownership: VehicleOwnership(vehicleMetadata: json)
         )
     }
 
@@ -27,6 +33,12 @@ public struct Vehicle: Codable, Equatable, Identifiable, Sendable {
         var values: [String: JSONValue] = ["vin": .string(vin)]
         if let modelName { values["modelName"] = .string(modelName) }
         if let plateNumber { values["plateNumber"] = .string(plateNumber) }
+        if !capabilities.reportedFeatures.isEmpty { values["funcConfig"] = capabilities.sanitizedFuncConfig }
+        switch ownership {
+        case .owner: values["isOwner"] = .bool(true)
+        case .shared: values["isOwner"] = .bool(false)
+        case .unknown: break
+        }
         try JSONValue.object(values).encode(to: encoder)
     }
 }

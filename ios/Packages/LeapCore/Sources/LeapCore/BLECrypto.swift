@@ -157,10 +157,24 @@ public enum BLEOfflineSM4 {
     }
 
     private static let fk: [UInt32] = [0xa3b1bac6, 0x56aa3350, 0x677d9197, 0xb27022dc]
-    private static let ck: [UInt32] = (0..<32).map { round in
-        (0..<4).reduce(UInt32(0)) { word, byte in
-            word << 8 | UInt32(((round * 4 + byte) * 7) & 255)
+    private static let ck: [UInt32] = makeRoundConstants()
+
+    // Explicit types avoid Swift 6.3's exponential inference through nested
+    // generic map/reduce and overloaded arithmetic/bitwise operators. The SM4
+    // definition remains CK[i,j] = ((4*i+j)*7) mod 256, big-endian per word.
+    static func makeRoundConstants() -> [UInt32] {
+        var constants: [UInt32] = []
+        constants.reserveCapacity(32)
+        for round: Int in 0..<32 {
+            var word: UInt32 = 0
+            for byte: Int in 0..<4 {
+                let offset: Int = round * 4 + byte
+                let component: UInt32 = UInt32((offset * 7) & 0xff)
+                word = (word << 8) | component
+            }
+            constants.append(word)
         }
+        return constants
     }
     private static let sbox: [UInt8] = [
         0xd6,0x90,0xe9,0xfe,0xcc,0xe1,0x3d,0xb7,0x16,0xb6,0x14,0xc2,0x28,0xfb,0x2c,0x05,

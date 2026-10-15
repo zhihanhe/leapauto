@@ -160,10 +160,7 @@ public actor LeapAPI {
         var candidate = state
         defer { commit(candidate, epoch: operation.epoch) }
         let response = try await gateway(path: "/app/app-global-service/v1/vehicle/list", session: &candidate, epoch: operation.epoch)
-        var seen = Set<String>()
-        let parsed = WireJSON.objects(in: response) { object in
-            object["vin"]?.stringValue.map { WireJSON.isIdentifier($0, min: 8, max: 32) } ?? false
-        }.map { Vehicle(json: .object($0)) }.filter { seen.insert($0.vin).inserted }
+        let parsed = Self.parseVehicles(response)
         vehicles = parsed
         if let chosen = parsed.first(where: { $0.vin == candidate.selectedVIN }) ?? parsed.first {
             if candidate.selectedVIN != chosen.vin { candidate.route = nil; lastStatus = nil }
@@ -203,6 +200,44 @@ public actor LeapAPI {
         return status
     }
 
+    /// Refresh capability declarations for the current vehicle without silently
+    /// switching to another VIN if access to the original vehicle was removed.
+    public func refreshSelectedVehicleMetadata() async throws -> Vehicle {
+        let operation = try begin(); defer { finish(operation.id) }
+        var candidate = state
+        defer { commit(candidate, epoch: operation.epoch) }
+        try requireVIN(candidate)
+        let response = try await gateway(path: "/app/app-global-service/v1/vehicle/list", session: &candidate, epoch: operation.epoch)
+        let parsed = Self.parseVehicles(response)
+        try check(operation.epoch)
+        vehicles = parsed
+        guard let selected = parsed.first(where: { $0.vin == candidate.selectedVIN }) else {
+            lastStatus = nil
+            throw LeapAPIError.unknownVehicle
+        }
+        candidate.selectedCarType = selected.carType ?? ""
+        return selected
+    }
+
+    /// Read-only inspection. Never fetches or provisions a key, uploads
+    /// preferences, starts Bluetooth, or treats cloud configuration as pairing.
+    public func connectionConfiguration() async throws -> VehicleConnectionConfiguration {
+        let operation = try begin(); defer { finish(operation.id) }
+        var candidate = state
+        defer { commit(candidate, epoch: operation.epoch) }
+        try requireVIN(candidate)
+        try await ensureGateway(&candidate, epoch: operation.epoch)
+        guard candidate.oldAuth?.accountID == candidate.newAuth?.accountID else { throw LeapAPIError.invalidSession }
+        let response = try await gateway(base: TrustedEndpoints.control,
+                                         path: "/carownerservice/v3/api/vehicleinfo/commonConfig",
+                                         parameters: ["appVersion": candidate.appVersion,
+                                                      "osType": candidate.clientPlatform.appPlatformHeader,
+                                                      "vin": candidate.selectedVIN],
+                                         session: &candidate, epoch: operation.epoch)
+        try check(operation.epoch)
+        return try VehicleConnectionConfiguration(response: response, expectedVIN: candidate.selectedVIN, fetchedAt: now())
+    }
+
     /// One user intent → one POST. Auth refresh happens before dispatch only.
     /// A timeout/disconnect cannot distinguish accepted from unsent, so never retry.
     public func send(command: LeapCommand, pin: String) async throws -> ControlSubmission {
@@ -211,8 +246,16 @@ public actor LeapAPI {
         defer { commit(candidate, epoch: operation.epoch) }
         try command.validate(status: lastStatus, now: now())
         try requireVIN(candidate)
+        try SentryControlPolicy.validate(command: command, ownership: vehicles.first(where: { $0.vin == candidate.selectedVIN })?.ownership ?? .unknown)
         try await ensureGateway(&candidate, epoch: operation.epoch)
         try await ensureLegacy(&candidate, epoch: operation.epoch)
+        if command == .sentryOn || command == .sentryOff {
+            // Revalidate server ownership immediately before dispatch, not just
+            // the UI's potentially stale vehicle-list snapshot.
+            let response = try await gateway(path: "/app/app-global-service/v1/vehicle/list", session: &candidate, epoch: operation.epoch)
+            vehicles = Self.parseVehicles(response)
+        }
+        try SentryControlPolicy.validate(command: command, ownership: vehicles.first(where: { $0.vin == candidate.selectedVIN })?.ownership ?? .unknown)
         // Refresh/crypto awaits can take time: check telemetry again immediately before dispatch.
         try command.validate(status: lastStatus, now: now())
         let request = try builder.control(command: command.build(), pin: pin, session: candidate, context: .live(now: now()))
@@ -246,6 +289,13 @@ public actor LeapAPI {
         var candidate = state
         defer { commit(candidate, epoch: operation.epoch) }
         try await refreshGateway(&candidate, epoch: operation.epoch)
+    }
+
+    private static func parseVehicles(_ response: JSONValue) -> [Vehicle] {
+        var seen = Set<String>()
+        return WireJSON.objects(in: response) { object in
+            object["vin"]?.stringValue.map { WireJSON.isIdentifier($0, min: 8, max: 32) } ?? false
+        }.map { Vehicle(json: .object($0)) }.filter { seen.insert($0.vin).inserted }
     }
 
     private func begin() throws -> (id: UUID, epoch: UInt64) {

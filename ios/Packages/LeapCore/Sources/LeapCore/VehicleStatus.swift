@@ -20,6 +20,7 @@ public struct VehicleStatus: Equatable, Sendable {
     public let chargeCompleted: Bool?
     public let locked: Bool?
     public let acOn: Bool?
+    public let sentryMode: Bool?
     public let cabinTemperature: Double?
     public let acTargetTemperature: Double?
     public let odometer: Double?
@@ -106,6 +107,7 @@ public struct VehicleStatus: Equatable, Sendable {
         chargeCompleted = chargingState.map { $0 == .completed }
         locked = value("driverDoorLockStatus", "1298")?.boolValue
         acOn = value("acSwitch", "1938")?.boolValue
+        sentryMode = value("sentryMode", "3636")?.boolValue
         cabinTemperature = number("interiorTemp", "1349")
         acTargetTemperature = number("acSetting", "2183")
         odometer = number("totalMileage", "1318", suffix: "km", nonnegative: true)

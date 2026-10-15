@@ -345,6 +345,149 @@ final class AppModelTests: XCTestCase {
         XCTAssertTrue(requests.isEmpty)
     }
 
+    func testSentryUIRequiresKnownOwnershipAndSignalBeforeConfirmation() {
+        let fixture = ConnectedModelFixture()
+        let model = fixture.model(ModelFixtureTransport([]))
+        let parked = fixture.parked.replacingOccurrences(of: "\"soc\":70", with: "\"soc\":70,\"3636\":0")
+        model.status = VehicleStatus(raw: try! JSONValue(data: Data(parked.utf8)), receivedAt: fixture.clock.read())
+        XCTAssertFalse(model.canRequest(.sentryOn))
+        model.request(.sentryOn)
+        XCTAssertNil(model.pendingCommand)
+        model.selectedVehicle?.ownership = .shared
+        XCTAssertFalse(model.canRequest(.sentryOn))
+        XCTAssertTrue(model.canRequest(.sentryOff))
+        model.selectedVehicle?.ownership = .owner
+        XCTAssertTrue(model.canRequest(.sentryOn))
+        model.request(.sentryOn)
+        XCTAssertEqual(model.pendingCommand, .sentryOn)
+        model.cancelPendingCommand()
+        model.status = DemoFixtures.status(now: fixture.clock.read())
+        XCTAssertFalse(model.canRequest(.sentryOn))
+    }
+
+    func testConnectionInspectionIsReadOnlyAndClearedOnLogout() async {
+        let fixture = ConnectedModelFixture()
+        let path = "/carownerservice/v3/api/vehicleinfo/commonConfig"
+        let transport = ModelFixtureTransport([.metadata, .init(path: path, reply: .json("{\"code\":0,\"data\":{\"config\":{}}}", 200))])
+        let model = fixture.model(transport)
+        await model.inspectConnectionConfiguration()
+        XCTAssertNotNil(model.connectionConfiguration)
+        XCTAssertFalse(model.connectionConfiguration!.hasBluetoothConfiguration)
+        XCTAssertNil(model.connectionConfigurationMessage)
+        XCTAssertNotNil(model.status)
+        let paths = await transport.paths()
+        XCTAssertEqual(paths, ["/app/app-global-service/v1/vehicle/list", path])
+        await model.logout()
+        XCTAssertNil(model.connectionConfiguration)
+        XCTAssertNil(model.connectionConfigurationMessage)
+    }
+
+    func testStatusRefreshAlsoUpdatesVehicleMetadataAndConfiguration() async {
+        let fixture = ConnectedModelFixture()
+        let configPath = "/carownerservice/v3/api/vehicleinfo/commonConfig"
+        let transport = ModelFixtureTransport([.status(fixture.parked), .metadata,
+            .init(path: configPath, reply: .json("{\"code\":0,\"data\":{}}", 200))])
+        let model = fixture.model(transport)
+        await model.refresh()
+        XCTAssertEqual(model.selectedVehicle?.modelName, "C10")
+        XCTAssertEqual(model.selectedVehicle?.capabilities[.hvac], .supported)
+        XCTAssertNotNil(model.vehicleMetadataUpdatedAt)
+        XCTAssertNotNil(model.connectionConfiguration)
+        let paths = await transport.paths()
+        XCTAssertEqual(paths, [ModelFixtureTransport.statusPath, "/app/app-global-service/v1/vehicle/list", configPath])
+    }
+
+    func testMissingSelectedVehicleClearsControlStateAfterMetadataRefresh() async {
+        let fixture = ConnectedModelFixture()
+        let transport = ModelFixtureTransport([.init(path: "/app/app-global-service/v1/vehicle/list", reply: .json("{\"code\":0,\"data\":[]}", 200))])
+        let model = fixture.model(transport)
+        await model.inspectConnectionConfiguration()
+        XCTAssertNil(model.selectedVehicle)
+        XCTAssertNil(model.status)
+        XCTAssertFalse(model.canControl)
+        XCTAssertNotNil(model.connectionConfigurationMessage)
+    }
+
+    func testVerifiedSentryWithUnchangedSourceTimestampRemainsUnconfirmed() async throws {
+        let fixture = ConnectedModelFixture()
+        let owner = "{\"code\":0,\"data\":[{\"vin\":\"FIXTUREVIN0000001\",\"isOwner\":true}]}"
+        let sameObservation = fixture.parked.replacingOccurrences(of: "\"soc\":70", with: "\"soc\":70,\"3636\":1")
+        let transport = ModelFixtureTransport([
+            .init(path: "/app/app-global-service/v1/vehicle/list", reply: .json(owner, 200)),
+            .status(sameObservation),
+            .init(path: "/app/app-global-service/v1/vehicle/list", reply: .json(owner, 200)),
+            .accepted, .poll("{\"result\":0}"), .status(sameObservation)
+        ])
+        let model = fixture.model(transport)
+        model.selectedVehicle?.ownership = .owner
+        model.status = VehicleStatus(raw: try JSONValue(data: Data(sameObservation.utf8)), receivedAt: fixture.clock.read())
+        _ = try await fixture.client?.bootstrap()
+        model.request(.sentryOn)
+        XCTAssertNotNil(model.pendingCommand)
+        await model.executePendingCommand(pin: "0000")
+        XCTAssertTrue(model.operationMessage?.contains("状态未确认") == true)
+        XCTAssertFalse(model.operationMessage?.contains("车况已刷新") == true)
+        await assertSingleCommand(transport, expectedPolls: 1, expectedStatusReads: 2)
+    }
+
+    func testRotatedCredentialsPersistWhenMetadataRemovesSelectedVehicle() async throws {
+        let fixture = ConnectedModelFixture()
+        let reply = try fixture.gatewayReply()
+        let access = try XCTUnwrap(JSONValue(data: Data(reply.utf8))["data"]?["accessToken"]?.stringValue)
+        let transport = ModelFixtureTransport([
+            .init(path: ModelFixtureTransport.refreshPath, reply: .json(reply, 200)),
+            .init(path: "/app/app-global-service/v1/vehicle/list", reply: .json("{\"code\":0,\"data\":[]}", 200))
+        ])
+        let model = fixture.model(transport, gatewayExpiry: fixture.clock.read().addingTimeInterval(30))
+        await model.inspectConnectionConfiguration()
+        XCTAssertEqual(model.mode, .connected)
+        XCTAssertNil(model.selectedVehicle)
+        XCTAssertNil(model.status)
+        XCTAssertFalse(model.canControl)
+        XCTAssertNotNil(model.connectionConfigurationMessage)
+        XCTAssertEqual(fixture.savedSessions.count, 1)
+        XCTAssertEqual(fixture.savedSessions.last?.newAuth?.accessToken, access)
+        XCTAssertEqual(fixture.savedSessions.last?.newAuth?.refreshToken, String(repeating: "n", count: 32))
+        let remaining = await transport.unusedCount()
+        XCTAssertEqual(remaining, 0)
+    }
+
+    func testDemoConnectionInspectionNeverUsesTransport() async {
+        let model = AppModel()
+        model.enterDemo()
+        await model.inspectConnectionConfiguration()
+        XCTAssertNil(model.connectionConfiguration)
+        XCTAssertTrue(model.connectionConfigurationMessage?.contains("离线演示") == true)
+    }
+
+    func testOptionalConfigurationFailurePreservesVehicleStatus() async {
+        let fixture = ConnectedModelFixture()
+        let transport = ModelFixtureTransport([.metadata, .init(path: "/carownerservice/v3/api/vehicleinfo/commonConfig", reply: .error(.networkUnavailable))])
+        let model = fixture.model(transport)
+        let soc = model.status?.batterySOC
+        await model.inspectConnectionConfiguration()
+        XCTAssertEqual(model.mode, .connected)
+        XCTAssertEqual(model.status?.batterySOC, soc)
+        XCTAssertNotNil(model.connectionConfigurationMessage)
+        XCTAssertNil(model.connectionConfiguration)
+        XCTAssertFalse(model.isBusy)
+    }
+
+    func testLogoutDiscardsLateConfiguration() async {
+        let fixture = ConnectedModelFixture()
+        let transport = ModelFixtureTransport([.metadata, .init(path: "/carownerservice/v3/api/vehicleinfo/commonConfig", reply: .suspended)])
+        let model = fixture.model(transport)
+        let task = Task { await model.inspectConnectionConfiguration() }
+        let suspended = await waitUntilSuspended(transport)
+        XCTAssertTrue(suspended)
+        await model.logout()
+        await transport.release("{\"code\":0,\"data\":{\"config\":{}}}")
+        await task.value
+        XCTAssertNil(model.connectionConfiguration)
+        XCTAssertEqual(model.mode, .signedOut)
+        XCTAssertFalse(model.isBusy)
+    }
+
     private func assertConfirmed(_ model: AppModel, file: StaticString = #filePath, line: UInt = #line) {
         XCTAssertTrue(model.operationMessage?.contains("已确认") == true, file: file, line: line)
         XCTAssertFalse(model.operationMessage?.contains("未知") == true, file: file, line: line)
@@ -393,6 +536,8 @@ private final class ConnectedModelFixture {
     private let suite = "LeapAutoConnectedTests." + UUID().uuidString
     private let defaults: UserDefaults
     var removalCount = 0
+    var savedSessions: [Session] = []
+    var client: LeapAPI?
 
     init() { defaults = UserDefaults(suiteName: suite)! }
     deinit { defaults.removePersistentDomain(forName: suite) }
@@ -415,9 +560,10 @@ private final class ConnectedModelFixture {
                 refreshToken: String(repeating: "r", count: 32), signKey: Data([1, 2, 3]), expiresAt: gatewayExpiry),
             selectedVIN: "FIXTUREVIN0000001", selectedCarType: "C16", route: RouteData(appRegion: TrustedEndpoints.global))
         let api = LeapAPI(session: session, transport: transport, crypto: ModelFixtureCryptography(), now: { clock.read() })
+        client = api
         let model = AppModel(api: api, pollingPolicy: policy, authenticate: authenticate,
             loadSession: { XCTFail("Connected command fixtures must not load a session"); return nil },
-            saveSession: { _ in }, removeSession: { self.removalCount += 1 },
+            saveSession: { self.savedSessions.append($0) }, removeSession: { self.removalCount += 1 },
             lifecycle: SessionLifecycleStore(defaults: defaults))
         model.mode = .connected
         model.vehicles = [Vehicle(vin: session.selectedVIN, modelName: "Fixture C16", plateNumber: nil)]
@@ -452,6 +598,7 @@ private actor ModelFixtureTransport: HTTPTransport {
     struct Step: Sendable {
         let path: String
         let reply: Reply
+        static var metadata: Self { .init(path: "/app/app-global-service/v1/vehicle/list", reply: .json("{\"code\":0,\"data\":[{\"vin\":\"FIXTUREVIN0000001\",\"carType\":\"C10\",\"funcConfig\":{\"HVAC\":{\"supported\":true}}}]}", 200)) }
         static func status(_ text: String) -> Self { .init(path: statusPath, reply: .json(text, 200)) }
         static var accepted: Self { .init(path: commandPath, reply: .json("{\"code\":0,\"data\":{\"msgID\":\"fixture-command\"}}", 200)) }
         static func poll(_ text: String) -> Self { .init(path: pollPath, reply: .json(text, 200)) }

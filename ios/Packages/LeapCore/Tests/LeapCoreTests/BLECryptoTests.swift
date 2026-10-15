@@ -5,6 +5,20 @@ import XCTest
 /// Synthetic offline fixtures only. Replay providers do not test EC arithmetic,
 /// X.509 validation, real credentials, Bluetooth, or network behavior.
 final class BLECryptoTests: XCTestCase {
+    func testSM4RoundConstantsRemainByteExact() {
+        let expected: [UInt32] = [
+            0x00070e15, 0x1c232a31, 0x383f464d, 0x545b6269,
+            0x70777e85, 0x8c939aa1, 0xa8afb6bd, 0xc4cbd2d9,
+            0xe0e7eef5, 0xfc030a11, 0x181f262d, 0x343b4249,
+            0x50575e65, 0x6c737a81, 0x888f969d, 0xa4abb2b9,
+            0xc0c7ced5, 0xdce3eaf1, 0xf8ff060d, 0x141b2229,
+            0x30373e45, 0x4c535a61, 0x686f767d, 0x848b9299,
+            0xa0a7aeb5, 0xbcc3cad1, 0xd8dfe6ed, 0xf4fb0209,
+            0x10171e25, 0x2c333a41, 0x484f565d, 0x646b7279
+        ]
+        XCTAssertEqual(BLEOfflineSM4.makeRoundConstants(), expected)
+    }
+
     func testSM3StandardKnownAnswers() {
         XCTAssertEqual(BLEOfflineSM3.hash(Data("abc".utf8)), hex("66c7f0f462eeedd9d1f2d46bdc10e4e24167c4875cf2f7a2297da02b8f4ba8e0"))
         XCTAssertEqual(BLEOfflineSM3.hash(Data(String(repeating: "abcd", count: 16).utf8)), hex("debe9ff92275b8a138604889c18e5a4d6fdb70e5387e5765293dcba39c0c5732"))
@@ -299,7 +313,7 @@ private final class FixtureProvider: BLESM2Provider {
 }
 
 private enum Fixture {
-    // Source: app/src/test/resources/bluetooth/generate-sm2-vectors.cjs,
+    // Source: API/fixtures/bluetooth/generate-sm2-vectors.cjs,
     // independently generated with Node/OpenSSL. Scalars 1 and 2 are PUBLIC test values.
     static let local = hex("0432c4ae2c1f1981195f9904466a39c9948fe30bbff2660be1715a4589334c74c7bc3736a2f4f6779c59bdcee36b692153d0a9877cc62a474002df32e52139f0a0")
     static let peer = hex("0456cefd60d7c87c000d58ef57fa73ba4d9c0dfa08c08a7331495c2e1da3f2bd5231b7e7e6cc8189f668535ce0f8eaf1bd6de84c182f6c8e716f780d3a970a23c3")
