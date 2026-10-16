@@ -130,6 +130,10 @@ public actor LeapAPI {
     }
 
     public func snapshot() -> Session { state }
+
+    /// The last successfully validated account vehicle list. This is an in-memory
+    /// copy, not a new read or proof of current vehicle access.
+    public func vehicleMetadataSnapshot() -> [Vehicle] { vehicles }
     public func logout() {
         generation &+= 1; activeOperation = nil; vehicles = []; lastStatus = nil
         state = Session()
@@ -142,7 +146,9 @@ public actor LeapAPI {
     public func importLegacyAuth(rawJSON: String, phone: String = "") async throws {
         let operation = try begin(); defer { finish(operation.id) }
         var candidate = try SessionImporter.parseLegacyJSON(rawJSON, phone: phone, now: now())
-        try await exchange(&candidate, epoch: operation.epoch)
+        // An imported account is transactional: do not publish any of its
+        // credentials into the current session before the import commits.
+        try await exchange(&candidate, epoch: operation.epoch, publishCredentials: false)
         try check(operation.epoch)
         state = candidate; vehicles = []; lastStatus = nil
     }
@@ -160,13 +166,14 @@ public actor LeapAPI {
         var candidate = state
         defer { commit(candidate, epoch: operation.epoch) }
         let response = try await gateway(path: "/app/app-global-service/v1/vehicle/list", session: &candidate, epoch: operation.epoch)
-        let parsed = Self.parseVehicles(response)
+        let parsed = try Self.parseVehicles(response)
+        try check(operation.epoch)
         vehicles = parsed
         if let chosen = parsed.first(where: { $0.vin == candidate.selectedVIN }) ?? parsed.first {
             if candidate.selectedVIN != chosen.vin { candidate.route = nil; lastStatus = nil }
             candidate.selectedVIN = chosen.vin; candidate.selectedCarType = chosen.carType ?? ""
             try await resolveRoute(&candidate, epoch: operation.epoch)
-        } else { candidate.selectedVIN = ""; candidate.selectedCarType = ""; candidate.route = nil; lastStatus = nil }
+        } else { clearSelectedVehicle(&candidate) }
         return parsed
     }
 
@@ -177,10 +184,7 @@ public actor LeapAPI {
         defer {
             // Refresh credentials can rotate before route resolution fails. Preserve
             // those rotations without changing the selected vehicle on a failed switch.
-            if operation.epoch == generation {
-                state.oldAuth = candidate.oldAuth; state.newAuth = candidate.newAuth
-                state.deviceID = candidate.deviceID
-            }
+            commitCredentials(candidate, epoch: operation.epoch)
         }
         candidate.selectedVIN = vehicle.vin; candidate.selectedCarType = vehicle.carType ?? ""; candidate.route = nil
         lastStatus = nil
@@ -208,11 +212,11 @@ public actor LeapAPI {
         defer { commit(candidate, epoch: operation.epoch) }
         try requireVIN(candidate)
         let response = try await gateway(path: "/app/app-global-service/v1/vehicle/list", session: &candidate, epoch: operation.epoch)
-        let parsed = Self.parseVehicles(response)
+        let parsed = try Self.parseVehicles(response)
         try check(operation.epoch)
         vehicles = parsed
         guard let selected = parsed.first(where: { $0.vin == candidate.selectedVIN }) else {
-            lastStatus = nil
+            clearSelectedVehicle(&candidate)
             throw LeapAPIError.unknownVehicle
         }
         candidate.selectedCarType = selected.carType ?? ""
@@ -253,7 +257,14 @@ public actor LeapAPI {
             // Revalidate server ownership immediately before dispatch, not just
             // the UI's potentially stale vehicle-list snapshot.
             let response = try await gateway(path: "/app/app-global-service/v1/vehicle/list", session: &candidate, epoch: operation.epoch)
-            vehicles = Self.parseVehicles(response)
+            let parsed = try Self.parseVehicles(response)
+            try check(operation.epoch)
+            vehicles = parsed
+            if !parsed.contains(where: { $0.vin == candidate.selectedVIN }) {
+                // Preserve the ownership-policy denial below while invalidating
+                // every local path that could reuse the removed vehicle.
+                clearSelectedVehicle(&candidate)
+            }
         }
         try SentryControlPolicy.validate(command: command, ownership: vehicles.first(where: { $0.vin == candidate.selectedVIN })?.ownership ?? .unknown)
         // Refresh/crypto awaits can take time: check telemetry again immediately before dispatch.
@@ -291,11 +302,21 @@ public actor LeapAPI {
         try await refreshGateway(&candidate, epoch: operation.epoch)
     }
 
-    private static func parseVehicles(_ response: JSONValue) -> [Vehicle] {
+    private static func parseVehicles(_ response: JSONValue) throws -> [Vehicle] {
+        // API/API.md documents a direct data array. Unknown envelopes and broken
+        // entries are not evidence that vehicle access was removed. In particular,
+        // never discover a vehicle recursively inside a capability declaration.
+        // Duplicate VINs are ambiguous even when some display fields agree.
+        guard let entries = response["data"]?.arrayValue else { throw LeapAPIError.invalidResponse }
+        var parsed: [Vehicle] = []
         var seen = Set<String>()
-        return WireJSON.objects(in: response) { object in
-            object["vin"]?.stringValue.map { WireJSON.isIdentifier($0, min: 8, max: 32) } ?? false
-        }.map { Vehicle(json: .object($0)) }.filter { seen.insert($0.vin).inserted }
+        for entry in entries {
+            guard let object = entry.objectValue, let vin = object["vin"]?.stringValue,
+                  WireJSON.isIdentifier(vin, min: 8, max: 32),
+                  seen.insert(vin).inserted else { throw LeapAPIError.invalidResponse }
+            parsed.append(Vehicle(json: entry))
+        }
+        return parsed
     }
 
     private func begin() throws -> (id: UUID, epoch: UInt64) {
@@ -310,6 +331,23 @@ public actor LeapAPI {
         try Task.checkCancellation()
     }
     private func commit(_ candidate: Session, epoch: UInt64) { if epoch == generation { state = candidate } }
+
+    /// Publish validated rotations before another awaited request. A deadline can
+    /// release the UI while a transport is still suspended, so snapshot() must
+    /// already expose credentials that the server may have made single-use.
+    /// Selection and route changes remain owned by the enclosing transaction.
+    private func commitCredentials(_ candidate: Session, epoch: UInt64) {
+        guard epoch == generation else { return }
+        state.oldAuth = candidate.oldAuth
+        state.newAuth = candidate.newAuth
+        state.deviceID = candidate.deviceID
+    }
+    private func clearSelectedVehicle(_ session: inout Session) {
+        session.selectedVIN = ""
+        session.selectedCarType = ""
+        session.route = nil
+        lastStatus = nil
+    }
     private func requireVIN(_ session: Session) throws {
         guard WireJSON.isIdentifier(session.selectedVIN, min: 8, max: 32) else { throw LeapAPIError.noVehicle }
     }
@@ -371,7 +409,7 @@ public actor LeapAPI {
             try await exchange(&session, epoch: epoch)
         }
     }
-    private func exchange(_ session: inout Session, epoch: UInt64) async throws {
+    private func exchange(_ session: inout Session, epoch: UInt64, publishCredentials: Bool = true) async throws {
         try validate(session)
         guard let old = session.oldAuth else { throw LeapAPIError.authenticationRequired }
         let request = try builder.gateway(path: "/base/base-user/account/v1/login", method: "POST",
@@ -379,6 +417,7 @@ public actor LeapAPI {
                                           session: session, context: .live(now: now()), authenticated: false)
         let response = try await execute(request, epoch: epoch)
         try applyGateway(response, to: &session)
+        if publishCredentials { commitCredentials(session, epoch: epoch) }
     }
     private func refreshGateway(_ session: inout Session, epoch: UInt64) async throws {
         if let auth = session.newAuth, !auth.refreshToken.isEmpty {
@@ -387,6 +426,7 @@ public actor LeapAPI {
             do {
                 let response = try await execute(request, epoch: epoch)
                 try applyGateway(response, to: &session)
+                commitCredentials(session, epoch: epoch)
                 return
             } catch LeapAPIError.authenticationRequired {
                 // A definitively rejected refresh may use the supported legacy recovery flow.
@@ -409,6 +449,7 @@ public actor LeapAPI {
         let ttl = data["tokenExpired"]?.doubleValue ?? 21_600
         guard ttl > 0, ttl <= 31_536_000 else { throw LeapAPIError.invalidResponse }
         old.expiresAt = now().addingTimeInterval(ttl); session.oldAuth = old
+        commitCredentials(session, epoch: epoch)
     }
     private func applyGateway(_ response: JSONValue, to session: inout Session) throws {
         guard let data = WireJSON.findObject(in: response, matching: { $0["accessToken"] != nil && $0["signParam"] != nil }),

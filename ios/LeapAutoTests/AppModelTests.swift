@@ -418,7 +418,7 @@ final class AppModelTests: XCTestCase {
             .init(path: "/app/app-global-service/v1/vehicle/list", reply: .json(owner, 200)),
             .accepted, .poll("{\"result\":0}"), .status(sameObservation)
         ])
-        let model = fixture.model(transport)
+        let model = fixture.model(transport, policy: .init(timeout: 0.08, initialDelay: 0.005, interval: 1))
         model.selectedVehicle?.ownership = .owner
         model.status = VehicleStatus(raw: try JSONValue(data: Data(sameObservation.utf8)), receivedAt: fixture.clock.read())
         _ = try await fixture.client?.bootstrap()
@@ -515,7 +515,7 @@ final class AppModelTests: XCTestCase {
 
 // Synthetic, offline-only dependencies. These cannot open sockets or perform
 // cryptography, local authentication, Keychain access, or widget publication.
-private struct ModelFixtureCryptography: ProtocolCryptography {
+struct ModelFixtureCryptography: ProtocolCryptography {
     func md5Short(_ value: String) throws -> String { "fixture-md5" }
     func sha256Hex(_ value: String) throws -> String { "fixture-sha256" }
     func hmacSHA256Hex(key: Data, value: String) throws -> String { "fixture-hmac" }
@@ -523,7 +523,7 @@ private struct ModelFixtureCryptography: ProtocolCryptography {
     func rsaEncryptPhone(_ phone: String) throws -> String { "fixture-phone-ciphertext" }
 }
 
-private final class ModelFixtureClock: @unchecked Sendable {
+final class ModelFixtureClock: @unchecked Sendable {
     private let lock = NSLock()
     private var instant = Date()
     func read() -> Date { lock.lock(); defer { lock.unlock() }; return instant }
@@ -531,7 +531,7 @@ private final class ModelFixtureClock: @unchecked Sendable {
 }
 
 @MainActor
-private final class ConnectedModelFixture {
+final class ConnectedModelFixture {
     let clock = ModelFixtureClock()
     private let suite = "LeapAutoConnectedTests." + UUID().uuidString
     private let defaults: UserDefaults
@@ -588,7 +588,7 @@ private final class ConnectedModelFixture {
     }
 }
 
-private actor ModelFixtureTransport: HTTPTransport {
+actor ModelFixtureTransport: HTTPTransport {
     static let commandPath = "/app/app-control-service/v3/api/appremotectl"
     static let pollPath = commandPath + "/query"
     static let statusPath = "/app/app-signal-service/signal/info/query"
@@ -608,10 +608,13 @@ private actor ModelFixtureTransport: HTTPTransport {
     private var continuation: CheckedContinuation<HTTPResult, Error>?
     private var suspendedURL: URL?
     private let onAcceptance: @Sendable () -> Void
+    private let onPoll: @Sendable () -> Void
 
-    init(_ steps: [Step], onAcceptance: @escaping @Sendable () -> Void = {}) {
+    init(_ steps: [Step], onAcceptance: @escaping @Sendable () -> Void = {},
+         onPoll: @escaping @Sendable () -> Void = {}) {
         self.steps = steps
         self.onAcceptance = onAcceptance
+        self.onPoll = onPoll
     }
 
     func execute(_ request: URLRequest) async throws -> HTTPResult {
@@ -626,6 +629,7 @@ private actor ModelFixtureTransport: HTTPTransport {
             XCTAssertEqual(request.httpMethod, "POST")
             onAcceptance()
         }
+        if step.path == Self.pollPath { onPoll() }
         switch step.reply {
         case .json(let body, let status): return HTTPResult(statusCode: status, body: Data(body.utf8), responseURL: request.url)
         case .error(let error): throw error

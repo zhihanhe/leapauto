@@ -20,6 +20,7 @@ final class AppModel: ObservableObject {
     @Published var connectionConfiguration: VehicleConnectionConfiguration?
     @Published var connectionConfigurationMessage: String?
     @Published var vehicleMetadataUpdatedAt: Date?
+    @Published var vehicleMetadataMessage: String?
 
     private var api: LeapAPI?
     private let lifecycle: SessionLifecycleStore
@@ -29,6 +30,12 @@ final class AppModel: ObservableObject {
     private let saveSession: (Session) throws -> Void
     private let removeSession: () throws -> Void
     private var generation = UUID()
+    private struct PendingSentryObservation {
+        let scope: UUID
+        let vin: String
+        let confirmation: SentryStateConfirmation
+    }
+    private var pendingSentryObservation: PendingSentryObservation?
     private var didRestore = false
     private lazy var widgetPublisher: WidgetSnapshotPublisher? = Self.isOfflineTestRun ? nil : WidgetSnapshotPublisher()
 
@@ -99,9 +106,11 @@ final class AppModel: ObservableObject {
     func enterDemo() {
         guard !isBusy, !isCommandRunning else { return }
         generation = UUID()
+        clearPendingSentryObservation()
         connectionConfiguration = nil
         connectionConfigurationMessage = nil
         vehicleMetadataUpdatedAt = nil
+        vehicleMetadataMessage = nil
         api = nil
         mode = .demo
         beginWidgetSession(source: .demo)
@@ -122,10 +131,12 @@ final class AppModel: ObservableObject {
         isBusy = true
         errorMessage = nil
         generation = UUID()
+        clearPendingSentryObservation()
         let scope = generation
         connectionConfiguration = nil
         connectionConfigurationMessage = nil
         vehicleMetadataUpdatedAt = nil
+        vehicleMetadataMessage = nil
         var importedClientCommitted = false
         beginWidgetSession(source: mode == .demo ? .demo : .vehicle)
         defer { if generation == scope { isBusy = false } }
@@ -226,21 +237,26 @@ final class AppModel: ObservableObject {
             guard generation == scope else { return }
             status = fresh
             publishWidgetStatus(fresh)
-            await updateConnectionDetails(client: client, scope: scope, reloadVehicleMetadata: true)
-            await persistCurrentSession(scope: scope)
-            guard generation == scope else { return }
+            resolvePendingSentryObservation(fresh)
         } catch {
             guard generation == scope else { return }
             await handleConnectedFailure(error, scope: scope)
         }
+        // Telemetry and vehicle-list availability are independent. A transient
+        // signal failure must not prevent capability/ownership revocation sync.
+        guard generation == scope, mode == .connected, !Task.isCancelled else { return }
+        await updateConnectionDetails(client: client, scope: scope, reloadVehicleMetadata: true)
+        await persistCurrentSession(scope: scope)
     }
 
     func selectVehicle(_ vehicle: Vehicle) async {
         guard !isBusy, !isCommandRunning, pendingCommand == nil, mode == .connected, let client = api else { return }
         generation = UUID()
+        clearPendingSentryObservation()
         connectionConfiguration = nil
         connectionConfigurationMessage = nil
         vehicleMetadataUpdatedAt = nil
+        vehicleMetadataMessage = nil
         let scope = generation
         isBusy = true
         status = nil
@@ -290,13 +306,17 @@ final class AppModel: ObservableObject {
     private func updateConnectionDetails(client: LeapAPI, scope: UUID, reloadVehicleMetadata: Bool) async {
         guard generation == scope, mode == .connected, let vin = selectedVehicle?.vin else { return }
         connectionConfigurationMessage = nil
+        var readingVehicleMetadata = reloadVehicleMetadata
+        if reloadVehicleMetadata { vehicleMetadataMessage = nil }
         do {
             if reloadVehicleMetadata {
                 let vehicle = try await client.refreshSelectedVehicleMetadata()
+                let refreshedVehicles = await client.vehicleMetadataSnapshot()
                 guard generation == scope, selectedVehicle?.vin == vin else { return }
                 selectedVehicle = vehicle
-                if let index = vehicles.firstIndex(where: { $0.vin == vin }) { vehicles[index] = vehicle }
+                vehicles = refreshedVehicles
                 vehicleMetadataUpdatedAt = Date()
+                readingVehicleMetadata = false
             }
             let configuration = try await client.connectionConfiguration()
             guard generation == scope, selectedVehicle?.vin == vin else { return }
@@ -308,11 +328,20 @@ final class AppModel: ObservableObject {
                failure == .authenticationRequired || failure == .invalidSession {
                 await handleConnectedFailure(error, scope: scope)
             } else {
-                if error as? LeapAPIError == .unknownVehicle {
+                if readingVehicleMetadata, error as? LeapAPIError == .unknownVehicle {
+                    let refreshedVehicles = await client.vehicleMetadataSnapshot()
+                    guard generation == scope, selectedVehicle?.vin == vin else { return }
+                    vehicles = refreshedVehicles
                     selectedVehicle = nil
                     status = nil
-                    vehicleMetadataUpdatedAt = nil
+                    vehicleMetadataUpdatedAt = Date()
+                    vehicleMetadataMessage = "车辆列表已更新，原车辆已不在当前账号列表中。请选择车辆。"
+                    clearPendingSentryObservation()
                     clearWidgetSnapshot()
+                } else if readingVehicleMetadata {
+                    // Preserve the last successful timestamp and declarations;
+                    // explicitly distinguish them from a successful new read.
+                    vehicleMetadataMessage = "车辆能力信息未能更新：\(safeMessage(error))"
                 }
                 connectionConfigurationMessage = safeMessage(error)
             }
@@ -344,6 +373,9 @@ final class AppModel: ObservableObject {
             return
         }
         isCommandRunning = true
+        // A new explicit operation supersedes the old result message. Do not let
+        // a later manual refresh resurrect an earlier sentry observation.
+        clearPendingSentryObservation()
         let scope = generation
         let vin = selectedVehicle?.vin
         var submitted = false
@@ -391,7 +423,7 @@ final class AppModel: ObservableObject {
                 // is not an ambiguous vehicle execution outcome.
                 submitted = false
                 operationMessage = nil
-                selectedVehicle?.ownership = .unknown
+                await syncVehicleMetadataAfterSentryDenial(scope: scope)
             }
             if submitted {
                 operationMessage = "执行结果尚未确认。请刷新车况核对，勿重复操作。"
@@ -411,32 +443,23 @@ final class AppModel: ObservableObject {
         guard generation == scope else { return }
         switch outcome {
         case .verified:
-            operationMessage = command.sentryTarget == nil
-                ? "车辆接口已确认指令完成。正在刷新车况…"
-                : "接口已返回结果，正在核对哨兵状态…"
+            if let target = command.sentryTarget {
+                await observeSentryState(client: client, target: target,
+                                         baselineTimestamp: sentryBaselineTimestamp, scope: scope, deadline: deadline)
+                return
+            }
+            operationMessage = "车辆接口已确认指令完成。正在刷新车况…"
             do {
                 let fresh = try await deadline.run { try await client.refreshStatus() }
                 guard generation == scope else { return }
                 status = fresh
                 publishWidgetStatus(fresh)
-                let hasNewSentryObservation: Bool
-                if let baseline = sentryBaselineTimestamp, let observed = fresh.sourceTimestamp {
-                    hasNewSentryObservation = observed > baseline
-                } else { hasNewSentryObservation = false }
-                if let target = command.sentryTarget,
-                   !hasNewSentryObservation || !fresh.isFreshForControl()
-                    || !SentryControlPolicy.isConfirmed(targetEnabled: target, telemetryEnabled: fresh.sentryMode) {
-                    operationMessage = "接口返回完成，但哨兵状态未确认达到目标。请稍后刷新核对，勿重复操作。"
-                } else {
-                    operationMessage = "车辆接口已确认指令完成，车况已刷新。"
-                }
+                operationMessage = "车辆接口已确认指令完成，车况已刷新。"
             } catch {
                 guard generation == scope else { return }
                 // Execution confirmation is terminal. A separate telemetry or
                 // authentication failure cannot turn it back into uncertainty.
-                let confirmed = command.sentryTarget == nil
-                    ? "车辆接口已确认指令完成。车况刷新未完成，请稍后核对。"
-                    : "接口返回完成，但哨兵车况刷新未完成，状态仍待核对。请勿重复操作。"
+                let confirmed = "车辆接口已确认指令完成。车况刷新未完成，请稍后核对。"
                 operationMessage = confirmed
                 await handleConnectedFailure(error, scope: scope, confirmedCommandMessage: confirmed)
             }
@@ -451,11 +474,101 @@ final class AppModel: ObservableObject {
         }
     }
 
+    private func observeSentryState(client: LeapAPI, target: Bool, baselineTimestamp: Date?,
+                                    scope: UUID, deadline: ControlObservationDeadline) async {
+        guard generation == scope, mode == .connected, let vin = selectedVehicle?.vin else { return }
+        let confirmation = SentryStateConfirmation(targetEnabled: target, baselineTimestamp: baselineTimestamp)
+        pendingSentryObservation = PendingSentryObservation(scope: scope, vin: vin, confirmation: confirmation)
+        operationMessage = "接口已返回结果，正在核对哨兵状态…"
+        do {
+            let outcome = try await SentryStateObserver.observe(
+                confirmation: confirmation, policy: pollingPolicy, deadline: deadline,
+                refresh: { try await client.refreshStatus() },
+                onObservation: { fresh in
+                    try await self.recordSentryObservation(fresh, scope: scope, vin: vin)
+                })
+            guard generation == scope, selectedVehicle?.vin == vin else { return }
+            switch outcome {
+            case .confirmed:
+                clearPendingSentryObservation()
+                operationMessage = sentryConfirmedMessage(target: target)
+            case .timedOut:
+                operationMessage = "接口返回完成，但哨兵状态未确认达到目标。自动核对已超时，请稍后刷新核对，勿重复操作。"
+            }
+        } catch {
+            guard generation == scope, selectedVehicle?.vin == vin else { return }
+            let unconfirmed = "接口返回完成，但哨兵车况刷新未完成，状态仍待核对。请稍后刷新，勿重复操作。"
+            operationMessage = unconfirmed
+            // A recoverable read failure keeps only the in-memory target for a
+            // later explicit refresh. Authentication failure clears it on logout.
+            await handleConnectedFailure(error, scope: scope, confirmedCommandMessage: unconfirmed)
+        }
+    }
+
+    private func recordSentryObservation(_ fresh: VehicleStatus, scope: UUID, vin: String) throws {
+        try Task.checkCancellation()
+        guard generation == scope, mode == .connected, selectedVehicle?.vin == vin else {
+            throw CancellationError()
+        }
+        status = fresh
+        publishWidgetStatus(fresh)
+    }
+
+    private func syncVehicleMetadataAfterSentryDenial(scope: UUID) async {
+        guard generation == scope, mode == .connected, let client = api,
+              let vin = selectedVehicle?.vin else { return }
+        let refreshedVehicles = await client.vehicleMetadataSnapshot()
+        let snapshot = await client.snapshot()
+        guard generation == scope, mode == .connected, selectedVehicle?.vin == vin else { return }
+        if snapshot.selectedVIN == vin, let vehicle = refreshedVehicles.first(where: { $0.vin == vin }) {
+            vehicles = refreshedVehicles
+            selectedVehicle = vehicle
+            // A denial can also come from the client's initial cached ownership
+            // gate, before a list request. Do not invent a new metadata timestamp.
+        } else if snapshot.selectedVIN.isEmpty {
+            // The API clears selection only after an authoritative list removed
+            // the selected VIN; stale telemetry must disappear with it.
+            vehicles = refreshedVehicles
+            selectedVehicle = nil
+            status = nil
+            connectionConfiguration = nil
+            connectionConfigurationMessage = nil
+            vehicleMetadataUpdatedAt = Date()
+            vehicleMetadataMessage = "车辆列表已更新，原车辆已不在当前账号列表中。请选择车辆。"
+            clearPendingSentryObservation()
+            clearWidgetSnapshot()
+        } else {
+            selectedVehicle?.ownership = .unknown
+        }
+    }
+
+    /// Explicit refresh may settle an earlier verified result after its automatic
+    /// observation budget ended. This only updates state feedback; it never sends.
+    private func resolvePendingSentryObservation(_ fresh: VehicleStatus) {
+        guard let pending = pendingSentryObservation else { return }
+        guard generation == pending.scope, mode == .connected, selectedVehicle?.vin == pending.vin else {
+            clearPendingSentryObservation()
+            return
+        }
+        guard pending.confirmation.isConfirmed(by: fresh) else { return }
+        clearPendingSentryObservation()
+        operationMessage = sentryConfirmedMessage(target: pending.confirmation.targetEnabled)
+    }
+
+    private func clearPendingSentryObservation() {
+        pendingSentryObservation = nil
+    }
+
+    private func sentryConfirmedMessage(target: Bool) -> String {
+        "已读取到更新车况，哨兵状态已确认为\(target ? "开启" : "关闭")。"
+    }
+
     @discardableResult
     func logout(preservingOperationMessage: String? = nil) async -> UUID {
         // Invalidate late responses before crossing an actor boundary.
         lifecycle.markLogoutRequested()
         generation = UUID()
+        clearPendingSentryObservation()
         let logoutScope = generation
         clearWidgetSnapshot()
         let old = api
@@ -467,6 +580,7 @@ final class AppModel: ObservableObject {
         connectionConfiguration = nil
         connectionConfigurationMessage = nil
         vehicleMetadataUpdatedAt = nil
+        vehicleMetadataMessage = nil
         pendingCommand = nil
         isCommandRunning = false
         isBusy = false

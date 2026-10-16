@@ -18,7 +18,7 @@ cp "$IOS_ROOT/scripts/portable-app-model/Combine.swift" "$WORK_DIR/Sources/Combi
 cp "$IOS_ROOT/scripts/portable-app-model/UnavailableAppleAdapters.swift" "$WORK_DIR/Sources/LeapAuto/"
 cp "$IOS_ROOT/LeapAuto/App/AppModel.swift" "$IOS_ROOT/LeapAuto/App/DemoFixtures.swift" \
   "$IOS_ROOT/LeapAuto/Security/SessionLifecycleStore.swift" "$WORK_DIR/Sources/LeapAuto/"
-cp "$IOS_ROOT/LeapAutoTests/AppModelTests.swift" "$WORK_DIR/Tests/LeapAutoTests/"
+cp "$IOS_ROOT/LeapAutoTests/"*.swift "$WORK_DIR/Tests/LeapAutoTests/"
 mkdir -p "$WORK_DIR/LeapCore"
 cp "$IOS_ROOT/Packages/LeapCore/Package.swift" "$WORK_DIR/LeapCore/"
 cp -R "$IOS_ROOT/Packages/LeapCore/Sources" "$IOS_ROOT/Packages/LeapCore/Tests" "$WORK_DIR/LeapCore/"

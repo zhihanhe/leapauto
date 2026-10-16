@@ -29,6 +29,29 @@ final class LeapAutoUITests: XCTestCase {
     }
 
     @MainActor
+    func testLocalVideoDiagnosticsNavigationDoesNotStartCapture() {
+        let app = XCUIApplication()
+        app.launchArguments = ["--demo"]
+        app.launch()
+        app.tabBars.buttons["我的"].tap()
+        let connection = app.buttons["settings.connection"]
+        XCTAssertTrue(connection.waitForExistence(timeout: 5))
+        connection.tap()
+        let page = app.scrollViews["screen.connection"]
+        XCTAssertTrue(page.waitForExistence(timeout: 5))
+        let link = app.buttons["connection.videoDiagnostics"]
+        for _ in 0..<8 where !link.isHittable { page.swipeUp() }
+        XCTAssertTrue(link.isHittable)
+        link.tap()
+        XCTAssertTrue(app.navigationBars["本机视频诊断"].waitForExistence(timeout: 5))
+        XCTAssertTrue(app.scrollViews["screen.videoDiagnostics"].exists)
+        XCTAssertTrue(app.buttons["video.start"].isEnabled)
+        XCTAssertFalse(app.buttons["video.stop"].isEnabled)
+        XCTAssertEqual(app.staticTexts["video.phase"].label, "尚未运行")
+        XCTAssertFalse(app.images["video.decodedPreview"].exists)
+    }
+
+    @MainActor
     func testOfflineDemoAndCancelControl() {
         let app = XCUIApplication()
         app.launchArguments = ["--demo"]

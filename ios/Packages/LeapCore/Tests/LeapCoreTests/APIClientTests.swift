@@ -58,6 +58,7 @@ private actor SuspendedTransport: HTTPTransport {
         continuation = nil
     }
     func commandCount() -> Int { requests.filter { $0.url?.path == "/app/app-control-service/v3/api/appremotectl" }.count }
+    func allRequests() -> [URLRequest] { requests }
 }
 
 private final class TestClock: @unchecked Sendable {
@@ -153,7 +154,185 @@ final class APIClientTests: XCTestCase {
         do { _ = try await api.refreshSelectedVehicleMetadata(); XCTFail("Must not select another vehicle") }
         catch { XCTAssertEqual(error as? LeapAPIError, .unknownVehicle) }
         let snapshot = await api.snapshot()
+        XCTAssertEqual(snapshot.selectedVIN, "")
+        XCTAssertEqual(snapshot.selectedCarType, "")
+        XCTAssertNil(snapshot.route)
+        let metadata = await api.vehicleMetadataSnapshot()
+        XCTAssertEqual(metadata.map(\.vin), ["OTHERFIXTUREVIN01"])
+    }
+
+    func testMetadataSnapshotReplacesCompleteListWithoutChangingSelection() async throws {
+        let first = #"{"code":0,"data":[{"vin":"FIXTUREVIN0000001","carType":"C10","funcConfig":{"HVAC":{"supported":true}}},{"vin":"OTHERFIXTUREVIN01","carType":"C16"}]}"#
+        let next = #"{"code":0,"data":[{"vin":"NEWFIXTUREVIN001","carType":"C11"},{"vin":"FIXTUREVIN0000001","carType":"C10","funcConfig":{"HVAC":{"supported":false}}}]}"#
+        let transport = FixtureTransport([.json(first), .json(next)])
+        let api = client(transport)
+        let empty = await api.vehicleMetadataSnapshot()
+        XCTAssertTrue(empty.isEmpty)
+        _ = try await api.refreshSelectedVehicleMetadata()
+        let previous = await api.vehicleMetadataSnapshot()
+        let selected = try await api.refreshSelectedVehicleMetadata()
+        let updated = await api.vehicleMetadataSnapshot()
+        let snapshot = await api.snapshot()
+        XCTAssertEqual(previous.map(\.vin), ["FIXTUREVIN0000001", "OTHERFIXTUREVIN01"])
+        XCTAssertEqual(updated.map(\.vin), ["NEWFIXTUREVIN001", "FIXTUREVIN0000001"])
+        XCTAssertEqual(updated.last, selected)
+        XCTAssertEqual(selected.capabilities[.hvac], .unsupported)
         XCTAssertEqual(snapshot.selectedVIN, "FIXTUREVIN0000001")
+        XCTAssertNotNil(snapshot.route)
+        let requests = await transport.allRequests()
+        XCTAssertEqual(requests.count, 2)
+        XCTAssertTrue(requests.allSatisfy { $0.httpMethod == "GET" && $0.url?.path == "/app/app-global-service/v1/vehicle/list" })
+    }
+
+    func testRemovedMetadataInvalidatesTelemetryAndStopsFurtherVehicleReads() async throws {
+        let transport = FixtureTransport([.json(parked), .json(#"{"code":0,"data":[]}"#)])
+        let api = client(transport)
+        _ = try await api.refreshStatus()
+        do { _ = try await api.refreshSelectedVehicleMetadata(); XCTFail("Selected vehicle was removed") }
+        catch { XCTAssertEqual(error as? LeapAPIError, .unknownVehicle) }
+        let metadata = await api.vehicleMetadataSnapshot()
+        XCTAssertTrue(metadata.isEmpty)
+        do { _ = try await api.refreshStatus(); XCTFail("No stale selected VIN may be queried") }
+        catch { XCTAssertEqual(error as? LeapAPIError, .noVehicle) }
+        do { _ = try await api.connectionConfiguration(); XCTFail("No stale selected VIN may be queried") }
+        catch { XCTAssertEqual(error as? LeapAPIError, .noVehicle) }
+        do { _ = try await api.pollResult(messageID: "fixture-result"); XCTFail("No stale selected VIN may be queried") }
+        catch { XCTAssertEqual(error as? LeapAPIError, .noVehicle) }
+        do { _ = try await api.send(command: .lock, pin: "0000"); XCTFail("Telemetry for removed vehicle must be discarded") }
+        catch { XCTAssertEqual(error as? CommandValidationError, .noVehicleStatus) }
+        let requests = await transport.count()
+        XCTAssertEqual(requests, 2, "Revoked selection must fail locally")
+    }
+
+    func testMalformedVehicleListsPreserveSelectionAndLastSuccessfulMetadata() async throws {
+        let valid = #"{"code":0,"data":[{"vin":"FIXTUREVIN0000001","carType":"C10","funcConfig":{"HVAC":{"supported":true}}}]}"#
+        let malformed = [
+            #"{"code":0}"#,
+            #"{"code":0,"data":null}"#,
+            #"{"code":0,"data":{}}"#,
+            #"{"code":0,"data":{"vehicles":[{"vin":"FIXTUREVIN0000001"}]}}"#,
+            #"{"code":0,"data":[null]}"#,
+            #"{"code":0,"data":["FIXTUREVIN0000001"]}"#,
+            #"{"code":0,"data":[{"vin":1234567890}]}"#,
+            #"{"code":0,"data":[{"vin":"short"}]}"#,
+            #"{"code":0,"data":[{"vin":"FIXTUREVIN0000001"},{"vin":"invalid value"}]}"#,
+            #"{"code":0,"data":[{"funcConfig":{"HVAC":{"vin":"FIXTUREVIN0000001"}}}]}"#,
+            #"{"code":0,"data":[{"vin":"FIXTUREVIN0000001"},{"vin":"FIXTUREVIN0000001"}]}"#,
+            #"{"code":0,"data":[{"vin":"FIXTUREVIN0000001","isOwner":true},{"vin":"FIXTUREVIN0000001","isOwner":false}]}"#
+        ]
+        for response in malformed {
+            let transport = FixtureTransport([.json(valid), .json(response)])
+            let api = client(transport)
+            _ = try await api.refreshSelectedVehicleMetadata()
+            let before = await api.snapshot()
+            let metadataBefore = await api.vehicleMetadataSnapshot()
+            do { _ = try await api.refreshSelectedVehicleMetadata(); XCTFail("Malformed list must not imply removal") }
+            catch { XCTAssertEqual(error as? LeapAPIError, .invalidResponse) }
+            let after = await api.snapshot()
+            let metadataAfter = await api.vehicleMetadataSnapshot()
+            XCTAssertEqual(after, before)
+            XCTAssertEqual(metadataAfter, metadataBefore)
+        }
+    }
+
+    func testVehicleListIgnoresNestedVINsAndPreservesTopLevelOrder() async throws {
+        let response = #"{"code":0,"data":[{"vin":"FIXTUREVIN0000001","carType":"C10","funcConfig":{"HVAC":{"supported":true,"vin":"NESTEDFIXTUREVIN1"}}},{"vin":"OTHERFIXTUREVIN01","carType":"C11"}]}"#
+        let transport = FixtureTransport([.json(response)])
+        let api = client(transport)
+        let selected = try await api.refreshSelectedVehicleMetadata()
+        let metadata = await api.vehicleMetadataSnapshot()
+        XCTAssertEqual(metadata.map(\.vin), ["FIXTUREVIN0000001", "OTHERFIXTUREVIN01"])
+        XCTAssertEqual(selected.modelName, "C10")
+        XCTAssertEqual(selected.capabilities[.hvac], .supported)
+        do { try await api.selectVehicle(Vehicle(vin: "NESTEDFIXTUREVIN1")); XCTFail("Nested VIN is not a vehicle") }
+        catch { XCTAssertEqual(error as? LeapAPIError, .unknownVehicle) }
+        let count = await transport.count()
+        XCTAssertEqual(count, 1)
+    }
+
+    func testVehicleMetadataNetworkFailureKeepsPriorSnapshot() async throws {
+        let valid = #"{"code":0,"data":[{"vin":"FIXTUREVIN0000001","carType":"C10"}]}"#
+        let transport = FixtureTransport([.json(valid), .error(.networkUnavailable)])
+        let api = client(transport)
+        _ = try await api.refreshSelectedVehicleMetadata()
+        let before = await api.snapshot()
+        let metadataBefore = await api.vehicleMetadataSnapshot()
+        do { _ = try await api.refreshSelectedVehicleMetadata(); XCTFail("Expected read failure") }
+        catch { XCTAssertEqual(error as? LeapAPIError, .networkUnavailable) }
+        let after = await api.snapshot()
+        let metadataAfter = await api.vehicleMetadataSnapshot()
+        XCTAssertEqual(after, before)
+        XCTAssertEqual(metadataAfter, metadataBefore)
+    }
+
+    func testRemovedMetadataStillCommitsRotatedCredentials() async throws {
+        let reply = try gatewayReply()
+        let transport = FixtureTransport([.json(reply.json), .json(#"{"code":0,"data":[]}"#)])
+        let api = client(transport, session: session(expiry: instant.addingTimeInterval(30)))
+        do { _ = try await api.refreshSelectedVehicleMetadata(); XCTFail("Selected vehicle was removed") }
+        catch { XCTAssertEqual(error as? LeapAPIError, .unknownVehicle) }
+        let after = await api.snapshot()
+        XCTAssertEqual(after.newAuth?.accessToken, reply.access)
+        XCTAssertEqual(after.deviceID, String(repeating: "b", count: 32))
+        XCTAssertEqual(after.selectedVIN, "")
+        XCTAssertEqual(after.selectedCarType, "")
+        XCTAssertNil(after.route)
+    }
+
+    func testLogoutDiscardsInflightVehicleMetadata() async throws {
+        let transport = SuspendedTransport()
+        let api = client(transport)
+        let refresh = Task { try await api.refreshSelectedVehicleMetadata() }
+        await transport.waitUntilSuspended()
+        await api.logout()
+        await transport.complete(#"{"code":0,"data":[{"vin":"FIXTUREVIN0000001","carType":"C10"}]}"#)
+        do { _ = try await refresh.value; XCTFail("Metadata cannot restore a logged out session") }
+        catch { XCTAssertEqual(error as? LeapAPIError, .sessionChanged) }
+        let after = await api.snapshot()
+        let metadata = await api.vehicleMetadataSnapshot()
+        XCTAssertFalse(after.isAuthenticated)
+        XCTAssertEqual(after.selectedVIN, "")
+        XCTAssertTrue(metadata.isEmpty)
+    }
+
+    func testCancelledVehicleMetadataDoesNotRevokeSelectionOrReplaceCache() async throws {
+        let initial = #"{"code":0,"data":[{"vin":"FIXTUREVIN0000001","carType":"C10"}]}"#
+        let transport = SuspendedTransport(firstResponse: initial)
+        let api = client(transport)
+        _ = try await api.refreshSelectedVehicleMetadata()
+        let before = await api.snapshot()
+        let metadataBefore = await api.vehicleMetadataSnapshot()
+        let refresh = Task { try await api.refreshSelectedVehicleMetadata() }
+        await transport.waitUntilSuspended()
+        refresh.cancel()
+        await transport.complete(#"{"code":0,"data":[]}"#)
+        do { _ = try await refresh.value; XCTFail("Cancelled metadata cannot remove selected vehicle") }
+        catch { XCTAssertTrue(error is CancellationError) }
+        let after = await api.snapshot()
+        let metadataAfter = await api.vehicleMetadataSnapshot()
+        XCTAssertEqual(after, before)
+        XCTAssertEqual(metadataAfter, metadataBefore)
+    }
+
+    func testBootstrapRejectsUnknownListEnvelopeWithoutClearingSelection() async throws {
+        let transport = FixtureTransport([.json(#"{"code":0,"data":{}}"#)])
+        let api = client(transport)
+        let before = await api.snapshot()
+        do { _ = try await api.bootstrap(); XCTFail("Unknown list envelope must not clear selection") }
+        catch { XCTAssertEqual(error as? LeapAPIError, .invalidResponse) }
+        let after = await api.snapshot()
+        XCTAssertEqual(after, before)
+    }
+
+    func testBootstrapAcceptsExplicitEmptyListAndClearsSelection() async throws {
+        let transport = FixtureTransport([.json(#"{"code":0,"data":[]}"#)])
+        let api = client(transport)
+        let list = try await api.bootstrap()
+        let after = await api.snapshot()
+        XCTAssertTrue(list.isEmpty)
+        XCTAssertEqual(after.selectedVIN, "")
+        XCTAssertEqual(after.selectedCarType, "")
+        XCTAssertNil(after.route)
     }
 
     func testSentryRechecksOwnerAndSubmitsExactlyOnce() async throws {
@@ -185,6 +364,52 @@ final class APIClientTests: XCTestCase {
         XCTAssertEqual(count, 0)
     }
 
+    func testSentryPreflightRemovalInvalidatesSelectedVehicleWithoutSubmitting() async throws {
+        let owner = #"{"code":0,"data":[{"vin":"FIXTUREVIN0000001","isOwner":true}]}"#
+        let status = parked.replacingOccurrences(of: "\"soc\":70", with: "\"soc\":70,\"3636\":0")
+        for command in [LeapCommand.sentryOn, .sentryOff] {
+            let transport = FixtureTransport([.json(owner), .json(status), .json(#"{"code":0,"data":[]}"#)])
+            let api = client(transport)
+            _ = try await api.bootstrap()
+            _ = try await api.refreshStatus()
+            do { _ = try await api.send(command: command, pin: "0000"); XCTFail("Removed vehicle must not receive a command") }
+            catch { XCTAssertEqual(error as? SentryControlError, .unknownOwnership) }
+            let after = await api.snapshot()
+            let metadata = await api.vehicleMetadataSnapshot()
+            XCTAssertEqual(after.selectedVIN, "")
+            XCTAssertEqual(after.selectedCarType, "")
+            XCTAssertNil(after.route)
+            XCTAssertTrue(metadata.isEmpty)
+            do { _ = try await api.refreshStatus(); XCTFail("Removed selection must not be queried again") }
+            catch { XCTAssertEqual(error as? LeapAPIError, .noVehicle) }
+            do { _ = try await api.send(command: .lock, pin: "0000"); XCTFail("Removed telemetry cannot authorize another command") }
+            catch { XCTAssertEqual(error as? CommandValidationError, .noVehicleStatus) }
+            let count = await transport.commandCount()
+            let total = await transport.count()
+            XCTAssertEqual(count, 0)
+            XCTAssertEqual(total, 3)
+        }
+    }
+
+    func testSentryMalformedPreflightListCannotReplaceMetadataOrSubmit() async throws {
+        let owner = #"{"code":0,"data":[{"vin":"FIXTUREVIN0000001","isOwner":true}]}"#
+        let status = parked.replacingOccurrences(of: "\"soc\":70", with: "\"soc\":70,\"3636\":0")
+        let transport = FixtureTransport([.json(owner), .json(status), .json(#"{"code":0,"data":{}}"#)])
+        let api = client(transport)
+        _ = try await api.bootstrap()
+        _ = try await api.refreshStatus()
+        let before = await api.snapshot()
+        let metadataBefore = await api.vehicleMetadataSnapshot()
+        do { _ = try await api.send(command: .sentryOn, pin: "0000"); XCTFail("Malformed preflight must not authorize command") }
+        catch { XCTAssertEqual(error as? LeapAPIError, .invalidResponse) }
+        let after = await api.snapshot()
+        let metadataAfter = await api.vehicleMetadataSnapshot()
+        XCTAssertEqual(after, before)
+        XCTAssertEqual(metadataAfter, metadataBefore)
+        let count = await transport.commandCount()
+        XCTAssertEqual(count, 0)
+    }
+
     func testGatewayCredentialRotationSurvivesLaterReadFailure() async throws {
         let reply = try gatewayReply()
         let transport = FixtureTransport([.json(reply.json), .error(.networkUnavailable)])
@@ -196,6 +421,191 @@ final class APIClientTests: XCTestCase {
         XCTAssertEqual(snapshot.newAuth?.accountID, "fixture-account", "Keep upstream legacy account identity")
         XCTAssertEqual(snapshot.deviceID, String(repeating: "b", count: 32))
         XCTAssertEqual(snapshot.newAuth?.signKey, Data([7, 0, 1, 10]))
+    }
+
+    func testGatewayRotationIsVisibleBeforeSuspendedTelemetryCompletes() async throws {
+        let reply = try gatewayReply()
+        let original = session(expiry: instant.addingTimeInterval(30))
+        let transport = SuspendedTransport(firstResponse: reply.json)
+        let api = client(transport, session: original)
+        let read = Task { try await api.refreshStatus() }
+        await transport.waitUntilSuspended()
+        let during = await api.snapshot()
+        XCTAssertEqual(during.newAuth?.accessToken, reply.access)
+        XCTAssertEqual(during.newAuth?.refreshToken, String(repeating: "n", count: 32))
+        XCTAssertEqual(during.newAuth?.signKey, Data([7, 0, 1, 10]))
+        XCTAssertEqual(during.deviceID, String(repeating: "b", count: 32))
+        XCTAssertEqual(during.oldAuth, original.oldAuth)
+        XCTAssertEqual(during.selectedVIN, original.selectedVIN)
+        XCTAssertEqual(during.selectedCarType, original.selectedCarType)
+        XCTAssertEqual(during.route, original.route)
+        read.cancel()
+        let afterCancellation = await api.snapshot()
+        XCTAssertEqual(afterCancellation, during, "Cancellation must not hide already accepted credentials")
+        await transport.complete(parked)
+        do { _ = try await read.value; XCTFail("Cancelled telemetry must not publish") }
+        catch { XCTAssertTrue(error is CancellationError) }
+        let afterLateResponse = await api.snapshot()
+        XCTAssertEqual(afterLateResponse, during)
+    }
+
+    func testGatewayExchangeIsVisibleBeforeSuspendedTelemetryCompletes() async throws {
+        let reply = try gatewayReply()
+        var original = session()
+        original.newAuth = nil
+        let transport = SuspendedTransport(firstResponse: reply.json)
+        let api = client(transport, session: original)
+        let read = Task { try await api.refreshStatus() }
+        await transport.waitUntilSuspended()
+        let during = await api.snapshot()
+        XCTAssertEqual(during.newAuth?.accessToken, reply.access)
+        XCTAssertEqual(during.deviceID, String(repeating: "b", count: 32))
+        XCTAssertEqual(during.selectedVIN, original.selectedVIN)
+        XCTAssertEqual(during.route, original.route)
+        let requests = await transport.allRequests()
+        XCTAssertEqual(requests.map { $0.url?.path }, ["/base/base-user/account/v1/login", "/app/app-signal-service/signal/info/query"])
+        await transport.complete(parked)
+        _ = try await read.value
+    }
+
+    func testLegacyRotationIsVisibleWhileGatewayExchangeIsStillSuspended() async throws {
+        let reply = try gatewayReply()
+        let rotatedLegacy = String(repeating: "l", count: 32)
+        let rotatedRefresh = String(repeating: "f", count: 32)
+        let legacy: JSONValue = .object(["code": .number(0), "data": .object([
+            "token": .string(rotatedLegacy), "refreshToken": .string(rotatedRefresh), "tokenExpired": .number(3600)
+        ])])
+        var original = session(expiry: instant.addingTimeInterval(30))
+        original.phone = "13000000000"
+        original.oldAuth?.refreshToken = String(repeating: "x", count: 32)
+        original.newAuth?.refreshToken = ""
+        let transport = SuspendedTransport(firstResponse: String(decoding: try legacy.encodedData(), as: UTF8.self))
+        let api = client(transport, session: original)
+        let read = Task { try await api.refreshStatus() }
+        await transport.waitUntilSuspended()
+        let duringExchange = await api.snapshot()
+        XCTAssertEqual(duringExchange.oldAuth?.token, rotatedLegacy)
+        XCTAssertEqual(duringExchange.oldAuth?.refreshToken, rotatedRefresh)
+        XCTAssertEqual(duringExchange.oldAuth?.expiresAt, instant.addingTimeInterval(3600))
+        XCTAssertEqual(duringExchange.newAuth, original.newAuth)
+        XCTAssertEqual(duringExchange.selectedVIN, original.selectedVIN)
+        XCTAssertEqual(duringExchange.route, original.route)
+        await transport.complete(reply.json)
+        await transport.waitUntilSuspended()
+        let duringTelemetry = await api.snapshot()
+        XCTAssertEqual(duringTelemetry.oldAuth?.token, rotatedLegacy)
+        XCTAssertEqual(duringTelemetry.newAuth?.accessToken, reply.access)
+        XCTAssertEqual(duringTelemetry.deviceID, String(repeating: "b", count: 32))
+        await transport.complete(parked)
+        _ = try await read.value
+    }
+
+    func testCredentialRotationDoesNotPublishPendingVehicleSelection() async throws {
+        let reply = try gatewayReply()
+        let vehicles = #"{"code":0,"data":[{"vin":"FIXTUREVIN0000001","carType":"C16"},{"vin":"OTHERFIXTUREVIN01","carType":"C10"}]}"#
+        let clock = TestClock(instant)
+        let original = session(expiry: instant.addingTimeInterval(360))
+        let transport = SuspendedTransport(firstResponse: vehicles)
+        let api = LeapAPI(session: original, transport: transport, crypto: FixtureCryptography(), now: { clock.read() })
+        let list = try await api.bootstrap()
+        clock.advance(70)
+        let selection = Task { try await api.selectVehicle(list[1]) }
+        await transport.waitUntilSuspended()
+        await transport.complete(reply.json)
+        await transport.waitUntilSuspended()
+        let during = await api.snapshot()
+        XCTAssertEqual(during.newAuth?.accessToken, reply.access)
+        XCTAssertEqual(during.deviceID, String(repeating: "b", count: 32))
+        XCTAssertEqual(during.selectedVIN, original.selectedVIN)
+        XCTAssertEqual(during.selectedCarType, original.selectedCarType)
+        XCTAssertEqual(during.route, original.route)
+        await transport.complete(#"{"code":0,"data":{"appRegion":"https://untrusted.invalid"}}"#)
+        do { try await selection.value; XCTFail("Failed route must not switch vehicles") }
+        catch { XCTAssertEqual(error as? LeapAPIError, .untrustedRoute) }
+        let after = await api.snapshot()
+        XCTAssertEqual(after, during)
+    }
+
+    func testObservationDeadlineSnapshotIncludesRotationBeforeLateReadReturns() async throws {
+        let reply = try gatewayReply()
+        let original = session(expiry: instant.addingTimeInterval(30))
+        let transport = SuspendedTransport(firstResponse: reply.json)
+        let api = client(transport, session: original)
+        let readerFinished = expectation(description: "Late read exits after cancellation")
+        let observation = Task {
+            try await ControlObservationDeadline(timeout: 1).run {
+                defer { readerFinished.fulfill() }
+                return try await api.refreshStatus()
+            }
+        }
+        await transport.waitUntilSuspended()
+        do { _ = try await observation.value; XCTFail("Suspended transport must reach deadline") }
+        catch ControlObservationError.deadlineExceeded { }
+        let afterDeadline = await api.snapshot()
+        XCTAssertEqual(afterDeadline.newAuth?.accessToken, reply.access)
+        XCTAssertEqual(afterDeadline.deviceID, String(repeating: "b", count: 32))
+        XCTAssertEqual(afterDeadline.selectedVIN, original.selectedVIN)
+        XCTAssertEqual(afterDeadline.route, original.route)
+        await transport.complete(parked)
+        await fulfillment(of: [readerFinished], timeout: 1)
+        let afterLateResponse = await api.snapshot()
+        XCTAssertEqual(afterLateResponse, afterDeadline)
+    }
+
+    func testLogoutAfterRotationCannotBeUndoneByLateTelemetry() async throws {
+        let reply = try gatewayReply()
+        let transport = SuspendedTransport(firstResponse: reply.json)
+        let api = client(transport, session: session(expiry: instant.addingTimeInterval(30)))
+        let read = Task { try await api.refreshStatus() }
+        await transport.waitUntilSuspended()
+        let during = await api.snapshot()
+        XCTAssertEqual(during.newAuth?.accessToken, reply.access)
+        await api.logout()
+        let loggedOut = await api.snapshot()
+        await transport.complete(parked)
+        do { _ = try await read.value; XCTFail("Late telemetry cannot revive credentials") }
+        catch { XCTAssertEqual(error as? LeapAPIError, .sessionChanged) }
+        let after = await api.snapshot()
+        XCTAssertEqual(after, loggedOut)
+        XCTAssertNil(after.oldAuth)
+        XCTAssertNil(after.newAuth)
+    }
+
+    func testLogoutRejectsDelayedCredentialRotation() async throws {
+        let reply = try gatewayReply()
+        let transport = SuspendedTransport()
+        let api = client(transport, session: session(expiry: instant.addingTimeInterval(30)))
+        let read = Task { try await api.refreshStatus() }
+        await transport.waitUntilSuspended()
+        await api.logout()
+        let loggedOut = await api.snapshot()
+        await transport.complete(reply.json)
+        do { _ = try await read.value; XCTFail("A logged-out generation cannot publish rotation") }
+        catch { XCTAssertEqual(error as? LeapAPIError, .sessionChanged) }
+        let after = await api.snapshot()
+        XCTAssertEqual(after, loggedOut)
+    }
+
+    func testCancelledImportDoesNotPublishReplacementCredentials() async throws {
+        let reply = try gatewayReply()
+        let transport = SuspendedTransport()
+        let original = session()
+        let api = client(transport, session: original)
+        let imported: JSONValue = .object([
+            "clientPlatform": .string("ios"), "deviceID": .string(String(repeating: "a", count: 32)),
+            "accountId": .string("different-import"), "token": .string(String(repeating: "i", count: 32))
+        ])
+        let raw = String(decoding: try imported.encodedData(), as: UTF8.self)
+        let importing = Task { try await api.importLegacyAuth(rawJSON: raw) }
+        await transport.waitUntilSuspended()
+        let during = await api.snapshot()
+        XCTAssertEqual(during, original)
+        importing.cancel()
+        await transport.complete(reply.json)
+        do { try await importing.value; XCTFail("Cancelled import must remain transactional") }
+        catch { XCTAssertTrue(error is CancellationError) }
+        let after = await api.snapshot()
+        XCTAssertEqual(after, original)
     }
 
     func testReadOnlyAuthenticationFailureRefreshesAndRetriesOnce() async throws {

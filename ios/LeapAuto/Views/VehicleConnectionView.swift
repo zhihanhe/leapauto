@@ -29,6 +29,11 @@ struct VehicleConnectionView: View {
                         Text("更新于：\(timestamp.formatted(date: .abbreviated, time: .shortened))")
                             .font(.caption).foregroundStyle(.secondary)
                     }
+                    if let message = model.vehicleMetadataMessage {
+                        Text(message)
+                            .font(.caption).foregroundStyle(.secondary)
+                            .accessibilityIdentifier("connection.metadata.message")
+                    }
                     MetricRow(title: "年款 / 配置 / 车机固件", value: "已知接口尚未提供，保持未知")
                     if let vehicle = model.selectedVehicle {
                         ForEach(vehicle.capabilities.features) { feature in
@@ -83,6 +88,16 @@ struct VehicleConnectionView: View {
                         .buttonStyle(.bordered)
                         .disabled(model.mode != .connected || model.selectedVehicle == nil || model.isBusy || model.isCommandRunning || model.pendingCommand != nil)
                         .accessibilityIdentifier("connection.inspect")
+                }
+            }
+
+            GlassCard {
+                VStack(alignment: .leading, spacing: 12) {
+                    SectionHeading(title: "本机视频诊断", caption: "独立离线测试")
+                    Text("使用合成画面验证本机 H.264 编码与解码。不会录屏或连接车辆，结果不代表车机支持投屏。")
+                        .font(.caption).foregroundStyle(.secondary)
+                    NavigationLink("打开本机视频诊断") { LocalVideoCodecDiagnosticsView() }
+                        .accessibilityIdentifier("connection.videoDiagnostics")
                 }
             }
         }
