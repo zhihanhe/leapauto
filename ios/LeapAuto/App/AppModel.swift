@@ -130,6 +130,7 @@ final class AppModel: ObservableObject {
         guard !isBusy, !isCommandRunning else { return }
         isBusy = true
         errorMessage = nil
+        operationMessage = nil
         generation = UUID()
         clearPendingSentryObservation()
         let scope = generation
@@ -170,16 +171,15 @@ final class AppModel: ObservableObject {
             vehicles = list
             vehicleMetadataUpdatedAt = Date()
             selectedVehicle = list.first(where: { $0.vin == snapshot.selectedVIN }) ?? list.first
-            if selectedVehicle != nil {
-                let fresh = try await client.refreshStatus()
-                guard generation == scope else { return }
-                status = fresh
-                publishWidgetStatus(fresh)
+            let telemetrySucceeded = await refreshConnectionState(client: client, scope: scope,
+                                                                 reloadVehicleMetadata: false)
+            guard generation == scope, mode == .connected, !Task.isCancelled,
+                  errorMessage == nil else { return }
+            if telemetrySucceeded {
+                operationMessage = "会话已导入本机钥匙串。请先核对所选车辆与车况。"
+            } else if vehicles.isEmpty {
+                operationMessage = "会话已导入本机钥匙串，当前账号的车辆列表为空。"
             }
-            await updateConnectionDetails(client: client, scope: scope, reloadVehicleMetadata: false)
-            await persistCurrentSession(scope: scope)
-            guard generation == scope else { return }
-            operationMessage = "会话已导入本机钥匙串。请先核对所选车辆与车况。"
         } catch {
             guard generation == scope else { return }
             if importedClientCommitted { await handleConnectedFailure(error, scope: scope) }
@@ -193,6 +193,7 @@ final class AppModel: ObservableObject {
 
     private func bootstrap() async {
         guard let client = api, !isBusy else { return }
+        errorMessage = nil
         isBusy = true
         let scope = generation
         defer { if generation == scope { isBusy = false } }
@@ -203,15 +204,7 @@ final class AppModel: ObservableObject {
             vehicles = list
             vehicleMetadataUpdatedAt = Date()
             selectedVehicle = list.first(where: { $0.vin == snapshot.selectedVIN }) ?? list.first
-            if selectedVehicle != nil {
-                let fresh = try await client.refreshStatus()
-                guard generation == scope else { return }
-                status = fresh
-                publishWidgetStatus(fresh)
-            }
-            await updateConnectionDetails(client: client, scope: scope, reloadVehicleMetadata: false)
-            await persistCurrentSession(scope: scope)
-            guard generation == scope else { return }
+            await refreshConnectionState(client: client, scope: scope, reloadVehicleMetadata: false)
         } catch {
             guard generation == scope else { return }
             await handleConnectedFailure(error, scope: scope)
@@ -251,6 +244,7 @@ final class AppModel: ObservableObject {
 
     func selectVehicle(_ vehicle: Vehicle) async {
         guard !isBusy, !isCommandRunning, pendingCommand == nil, mode == .connected, let client = api else { return }
+        errorMessage = nil
         generation = UUID()
         clearPendingSentryObservation()
         connectionConfiguration = nil
@@ -268,17 +262,51 @@ final class AppModel: ObservableObject {
             try await client.selectVehicle(vehicle)
             guard generation == scope else { return }
             selectedVehicle = vehicle
-            let fresh = try await client.refreshStatus()
-            guard generation == scope else { return }
-            status = fresh
-            publishWidgetStatus(fresh)
-            await updateConnectionDetails(client: client, scope: scope, reloadVehicleMetadata: true)
-            await persistCurrentSession(scope: scope)
-            guard generation == scope else { return }
+            await refreshConnectionState(client: client, scope: scope, reloadVehicleMetadata: true)
         } catch {
             guard generation == scope else { return }
             await handleConnectedFailure(error, scope: scope)
         }
+    }
+
+    /// Bootstrap/import already loaded the list; selection must read it again
+    /// for current ownership and capabilities even when telemetry is unavailable.
+    @discardableResult
+    private func refreshConnectionState(client: LeapAPI, scope: UUID,
+                                        reloadVehicleMetadata: Bool) async -> Bool {
+        guard generation == scope, mode == .connected else { return false }
+        if Task.isCancelled {
+            // A preceding successful bootstrap/selection may have rotated credentials.
+            await persistCurrentSession(scope: scope)
+            return false
+        }
+        var telemetrySucceeded = false
+        if selectedVehicle != nil {
+            do {
+                let fresh = try await client.refreshStatus()
+                guard generation == scope, mode == .connected else { return false }
+                if Task.isCancelled {
+                    await persistCurrentSession(scope: scope)
+                    return false
+                }
+                status = fresh
+                publishWidgetStatus(fresh)
+                telemetrySucceeded = true
+            } catch {
+                guard generation == scope else { return false }
+                await handleConnectedFailure(error, scope: scope)
+                if error is CancellationError { return false }
+            }
+        }
+        // Credential failures may log out; cancellation must not start another read.
+        guard generation == scope, mode == .connected else { return false }
+        if Task.isCancelled {
+            await persistCurrentSession(scope: scope)
+            return false
+        }
+        await updateConnectionDetails(client: client, scope: scope, reloadVehicleMetadata: reloadVehicleMetadata)
+        await persistCurrentSession(scope: scope)
+        return telemetrySucceeded && generation == scope && mode == .connected && !Task.isCancelled
     }
 
     /// User-initiated metadata read; no pairing, certificate provisioning or BLE
@@ -304,7 +332,7 @@ final class AppModel: ObservableObject {
     /// Best-effort metadata refresh after connection/selection/status refresh.
     /// Failures stay separate from valid telemetry and never start BLE hardware.
     private func updateConnectionDetails(client: LeapAPI, scope: UUID, reloadVehicleMetadata: Bool) async {
-        guard generation == scope, mode == .connected, let vin = selectedVehicle?.vin else { return }
+        guard generation == scope, mode == .connected, !Task.isCancelled, let vin = selectedVehicle?.vin else { return }
         connectionConfigurationMessage = nil
         var readingVehicleMetadata = reloadVehicleMetadata
         if reloadVehicleMetadata { vehicleMetadataMessage = nil }
@@ -312,14 +340,14 @@ final class AppModel: ObservableObject {
             if reloadVehicleMetadata {
                 let vehicle = try await client.refreshSelectedVehicleMetadata()
                 let refreshedVehicles = await client.vehicleMetadataSnapshot()
-                guard generation == scope, selectedVehicle?.vin == vin else { return }
+                guard generation == scope, mode == .connected, !Task.isCancelled, selectedVehicle?.vin == vin else { return }
                 selectedVehicle = vehicle
                 vehicles = refreshedVehicles
                 vehicleMetadataUpdatedAt = Date()
                 readingVehicleMetadata = false
             }
             let configuration = try await client.connectionConfiguration()
-            guard generation == scope, selectedVehicle?.vin == vin else { return }
+            guard generation == scope, mode == .connected, !Task.isCancelled, selectedVehicle?.vin == vin else { return }
             connectionConfiguration = configuration
         } catch {
             guard generation == scope, selectedVehicle?.vin == vin else { return }
